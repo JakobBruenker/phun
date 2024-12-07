@@ -4,14 +4,12 @@
 module Main where
 
 import Control.Monad (when)
-import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, MonadWriter (listen))
+import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks)
 import Data.Foldable (traverse_)
 import Data.Functor ((<&>))
-import Data.Functor.Const (Const (..))
-import Data.Functor.Identity (Identity)
+import Data.Functor.Identity (Identity (..))
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
-import Data.Kind (Type)
 import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
@@ -20,63 +18,76 @@ import Data.Maybe (isNothing)
 import Data.Monoid (Endo(..))
 import Data.Text (Text)
 import GHC.Natural (Natural)
+import Data.Kind (Type)
 
-type Parsed = Expr (Const ())
+-- | LHS: Expr, RHS: Type
+type Typed :: Pass -> Type -> Type
+data Typed p e = e ::: UExpr (Typed p) p
 
-type UVarOr = Either UVar
+type Parsed = UExpr Identity PParsed
 
-type Inferring = Expr UVarOr
+type Inferring = UExpr (Typed PInferring) PInferring
 
-type Unifiable = UVarOr Inferring
+type InferringExpr = Expr (Typed PInferring) PInferring
 
--- | Nonsense is an expression that didn't typecheck, but that has a certain type. Also carries the original expression.
-data Nonsense f = Nonsense (f (Expr f)) Parsed
-
-type Checked = Expr Identity
-
-data SomeExpr
-  = PExpr Parsed
-  | IExpr Inferring
-  | CExpr Checked
+type Checked = UExpr (Typed PChecked) PChecked
 
 -- | Unification Variables
 newtype UVar = UVar {id :: Int} deriving Eq
 
+instance Show UVar where
+  show (UVar i) = "u" ++ show i
+
 type Id = Text
 
-type Expr :: (Type -> Type) -> Type
-data Expr f
-  = Univ Natural
-  | Var (f (Expr f)) Id
-  | XExpr (XXExpr f)
+data Pass = PParsed | PInferring | PChecked
 
-deriving instance (Show (f (Expr f)), Show (XXExpr f)) => Show (Expr f)
+type UExpr :: (Type -> Type) -> Pass -> Type
+data UExpr f p where
+  Univ :: Natural -> UExpr f p
+  Expr :: (f (Expr f p)) -> UExpr f p
+  UV :: UVar -> UExpr f PInferring
+  Hole :: UExpr f PParsed
 
-data DataConCan'tHappen deriving Show
+instance Show (f (Expr f p)) => Show (UExpr f p) where
+  show (Univ n) = "Type" ++ show n
+  show (Expr e) = show e
+  show (UV u) = show u
+  show Hole = "_"
 
-type family XXExpr f where
-  XXExpr (Const ()) = DataConCan'tHappen
-  XXExpr (Either UVar) = Nonsense (Either UVar)
-  XXExpr Identity = DataConCan'tHappen
+type Expr :: (Type -> Type) -> Pass -> Type
+data Expr f p where
+  Var :: Id -> Expr f p
+  App :: (f (UExpr f p)) -> (f (UExpr f p)) -> Expr f p -- ^ NB: This is x f, not f x
+  Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
+
+instance Show (f (UExpr f p)) => Show (Expr f p) where
+  show (Var i) = show i
+  show (App x f) = show x ++ " " ++ show f
+  show (Nonsense e) = show e
 
 data Error
-  -- source expr, expected type, actual type
   -- TODO add source location
-  = TypeMismatch Parsed Unifiable Unifiable (NonEmpty UnificationFailure)
+  = TypeMismatch Parsed Inferring Inferring (NonEmpty UnificationFailure)
+  -- ^ source expr, expected type, actual type
   | VarOutOfScope Id
 
 -- TODO add details
 data UnificationFailure
   = Can'tUnifyTypes Inferring Inferring
+  | Can'tUnifyExprs InferringExpr InferringExpr
   | Can'tUnifyVars Id Id
   | Can'tUnifyLevels Natural Natural
 
 data TcState = TcState
   { nextUVar :: Int
-  , subst :: IntMap Unifiable
+  , subst :: IntMap Inferring
   }
 
-type TcM a = RWS (Map Id (UVarOr Inferring)) (DList Error) TcState a
+-- | Typechecker monad.
+--
+-- Reader: Map from variable names to their types
+type TcM a = RWS (Map Id Inferring) (DList Error) TcState a
 
 type DList a = Endo [a]
 
@@ -92,7 +103,7 @@ silence = censor $ const emptyDList
 raise :: Error -> TcM ()
 raise e = tell $ Endo (e :)
 
-lookupVar :: Id -> TcM Unifiable
+lookupVar :: Id -> TcM Inferring
 lookupVar i = do
   t <- asks (M.lookup i)
   when (isNothing t) . raise $ VarOutOfScope i
@@ -100,59 +111,92 @@ lookupVar i = do
     Nothing -> do
       raise $ VarOutOfScope i
       u <- freshUVar
-      pure (Left u)
+      pure (UV u)
     Just t' -> pure t'
 
-lookupUVar :: UVar -> TcM (Maybe Unifiable)
+lookupUVar :: UVar -> TcM (Maybe Inferring)
 lookupUVar u = IM.lookup u.id <$> gets (.subst)
 
 -- | Get the most concrete type we have for a UVar
-normalizeUVar :: UVar -> TcM Unifiable
+normalizeUVar :: UVar -> TcM Inferring
 normalizeUVar v = do
   t <- lookupUVar v
   case t of
-    Nothing -> pure (Left v)
-    Just (Left v') -> normalizeUVar v' -- TODO maybe zonk in this case
+    Nothing -> pure (UV v)
+    Just (UV v') -> normalizeUVar v' -- TODO maybe zonk in this case
     Just t' -> pure t'
 
-normalizeUnifiable :: Unifiable -> TcM Unifiable
-normalizeUnifiable = \case
-  Left v -> normalizeUVar v
-  Right t -> pure (Right t)
+class Normalize a where
+  normalize :: a -> TcM a
 
-unifyInferring :: Inferring -> Inferring -> TcM [UnificationFailure]
-unifyInferring = \cases
-  (Univ n) (Univ n')
-    | n == n' -> pure []
-    | otherwise -> pure [Can'tUnifyLevels n n']
-  (Var t a) (Var t' a') -> ([Can'tUnifyVars a a' | a /= a'] ++) <$> unify t t'
-  -- If we have a nonsense expression, we must have already gotten a type error,
-  -- so there's no point in reporting that we can't unify Nonsense with
-  -- something. We still try to unify the kind, though
-  (XExpr (Nonsense t _)) t' -> unify t (typeOf t')
-  t (XExpr (Nonsense t' _)) -> unify (typeOf t) t'
-  t t' -> pure [Can'tUnifyTypes t t']
+instance Normalize InferringExpr where
+  -- TODO we probably have to actually normalize the types here i.e. eval them, not just replace the UVars - Q: Can we ensure we only get normalizing terms here?
+  normalize :: InferringExpr -> TcM InferringExpr
+  normalize = \case
+    Var a -> pure (Var a)
+    App x f -> App <$> normalize x <*>  normalize f
+    Nonsense e -> pure (Nonsense e)
+
+instance Normalize u => Normalize (Typed PInferring u) where
+  normalize :: Typed PInferring u -> TcM (Typed PInferring u)
+  normalize (t ::: k) = do
+    t' <- normalize t
+    k' <- normalize k
+    pure (t' ::: k')
+
+instance Normalize Inferring where
+  -- | Normalize all UVars in a type
+  -- TODO maybe zonk here
+  normalize :: Inferring -> TcM Inferring
+  normalize = \case
+    Univ n -> pure (Univ n)
+    Expr e -> Expr <$> normalize e
+    UV v -> normalizeUVar v
+
+class Unify a where
+  -- | Intended argument order: Expected, then actual (order is only relevant for error reporting)
+  unify :: a -> a -> TcM [UnificationFailure]
+
+instance Unify InferringExpr where
+  unify :: InferringExpr -> InferringExpr -> TcM [UnificationFailure]
+  unify = \cases
+    (Var a) (Var a') -> pure [Can'tUnifyVars a a' | a /= a']
+    (App x f) (App x' f') -> do
+      xErrs <- unify x x'
+      fErrs <- unify f f'
+      pure $ xErrs <> fErrs
+    t t' -> pure [Can'tUnifyExprs t t']
+
+instance Unify u => Unify (Typed PInferring u) where
+  unify (t ::: k) (t' ::: k') = do
+    kErrs <- unify k k'
+    tErrs <- unify t t'
+    pure $ kErrs <> tErrs
+
+instance Unify Inferring where
+-- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
+  unify :: Inferring -> Inferring -> TcM [UnificationFailure]
+  unify = \cases
+    (UV u) (UV u') | u == u' -> pure [] -- minor optimization: Only look up uvars if necessary
+    u u' -> do
+      t <- normalize u
+      t' <- normalize u'
+      go t t'
+    where
+      go :: Inferring -> Inferring -> TcM [UnificationFailure]
+      go = \cases
+        (Univ n) (Univ n') -> pure [Can'tUnifyLevels n n']
+        (UV u) (UV u')
+          | u == u' -> pure []
+          | otherwise -> substUVar u' (UV u) >> pure [] -- order doesn't really matter, but it seems reasonable to take the expected as "ground truth"
+        e (UV u') -> substUVar u' e >> pure []
+        (UV u) e -> substUVar u e >> pure []
+        (Expr t) (Expr t') -> unify t t'
+        t t' -> pure [Can'tUnifyTypes t t']
 
 -- TODO occurs check
-substUVar :: UVar -> Unifiable -> TcM ()
+substUVar :: UVar -> Inferring -> TcM ()
 substUVar v t = modify' \s -> s{subst = IM.insert v.id t s.subst}
-
--- | Intended argument order: Expected, then actual
-unify :: Unifiable -> Unifiable -> TcM [UnificationFailure]
-unify = \cases
-  (Left u) (Left u') | u == u' -> pure [] -- minor optimization
-  u u' -> do
-    t <- normalizeUnifiable u
-    t' <- normalizeUnifiable u'
-    go t t'
-  where
-    go = \cases
-      (Left u) (Left u')
-        | u == u' -> pure []
-        | otherwise -> substUVar u (Left u') >> pure []
-      (Left u) (Right t') -> substUVar u (Right t') >> pure []
-      (Right t) (Left u') -> substUVar u' (Right t) >> pure []
-      (Right t) (Right t') -> unifyInferring t t'
 
 freshUVar :: TcM UVar
 freshUVar = do
@@ -160,48 +204,44 @@ freshUVar = do
   modify' \s -> s{nextUVar = i + 1}
   pure $ UVar i
 
-fillWithUVars :: Parsed -> TcM Inferring
-fillWithUVars = \case
-  Univ n -> pure (Univ n)
-  Var _ a -> do
-    u <- freshUVar
-    pure (Var (Left u) a)
-
 -- TODO: termination checker
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
-  u@(Univ n) -> do
-    (_, errs) <- listen $ tryUnifyInferring expr expected (Univ (n + 1))
-    pure if nullDList errs
-      then (Univ n)
-      else XExpr (Nonsense (Right $ Univ (n + 1)) u)
-  Var (Const ()) a -> do
-    varType <- asks (M.lookup a)
-    traverse_ (tryUnify expr (Right expected)) varType
-    pure (Var (Right expected) a)
+  Univ n -> do
+    let uType = Univ (n + 1)
+    errs <- unify expected uType
+    case NE.nonEmpty errs of
+      Nothing -> pure $ Univ n
+      Just es -> do
+        raise $ TypeMismatch expr expected uType es
+        pure $ Expr (Nonsense expr ::: expected)
+  Expr (Identity e) -> case e of
+    Var a -> do
+      varType <- lookupVar a
+      tryUnify expr expected varType
+      pure $ Expr (Var a ::: expected)
+    App x f -> undefined -- TODO
+  Hole -> UV <$> freshUVar -- XXX Is this right? It seems like we ignore the expected type. But maybe this will just always result in an unsolved uvar, which might be fine
   
-tryUnify :: Parsed -> Unifiable -> Unifiable -> TcM ()
+tryUnify :: Parsed -> Inferring -> Inferring -> TcM ()
 tryUnify expr expt act = unify expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr expt act)
-
-tryUnifyInferring :: Parsed -> Inferring -> Inferring -> TcM ()
-tryUnifyInferring expr expt act = unifyInferring expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr (Right expt) (Right act))
 
 infer :: Parsed -> TcM Inferring
 infer expr = case expr of
   Univ n -> pure $ Univ n
-  Var (Const ()) a -> do
-    varT <- lookupVar a
-    pure (Var varT a)
- 
-typeOf :: Inferring -> Unifiable
-typeOf = \case
-  Univ n -> Right $ Univ (n + 1)
-  Var t _ -> t
-  XExpr (Nonsense t _) -> t
+  Expr (Identity e) -> case e of
+    Var a -> do
+      varT <- lookupVar a
+      pure (Expr $ Var a ::: varT)
+    App x f -> undefined -- TODO
+  Hole -> UV <$> freshUVar
 
 eval :: Checked -> Checked
-eval u@(Univ _) = u
-eval v@(Var _ _) = v
+eval = \case
+  u@(Univ _) -> u
+  Expr (e ::: t) -> case e of
+    Var a -> Expr (Var a ::: t)
+    App x f -> undefined -- TODO
 
 main :: IO ()
 main = putStrLn "Hello, Haskell!"
