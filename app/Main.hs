@@ -3,7 +3,11 @@
 
 module Main where
 
+import Control.Monad (when)
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, MonadWriter (listen))
+import Data.Foldable (traverse_)
+import Data.Functor ((<&>))
+import Data.Functor.Const (Const (..))
 import Data.Functor.Identity (Identity)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
@@ -12,15 +16,12 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Maybe (isNothing)
 import Data.Monoid (Endo(..))
 import Data.Text (Text)
 import GHC.Natural (Natural)
-import Data.Maybe (isNothing)
-import Control.Monad (when)
-import Data.Functor ((<&>))
-import Data.Foldable (traverse_, for_)
 
-type Parsed = Expr Maybe
+type Parsed = Expr (Const ())
 
 type UVarOr = Either UVar
 
@@ -54,7 +55,7 @@ deriving instance (Show (f (Expr f)), Show (XXExpr f)) => Show (Expr f)
 data DataConCan'tHappen deriving Show
 
 type family XXExpr f where
-  XXExpr Maybe = DataConCan'tHappen
+  XXExpr (Const ()) = DataConCan'tHappen
   XXExpr (Either UVar) = Nonsense (Either UVar)
   XXExpr Identity = DataConCan'tHappen
 
@@ -162,10 +163,9 @@ freshUVar = do
 fillWithUVars :: Parsed -> TcM Inferring
 fillWithUVars = \case
   Univ n -> pure (Univ n)
-  Var Nothing a -> do
-    i <- gets (.nextUVar)
-    pure (Var (Left (UVar i)) a)
-  Var (Just t) a -> Var . Right <$> fillWithUVars t <*> pure a
+  Var _ a -> do
+    u <- freshUVar
+    pure (Var (Left u) a)
 
 -- TODO: termination checker
 check :: Inferring -> Parsed -> TcM Inferring
@@ -175,14 +175,9 @@ check expected expr = case expr of
     pure if nullDList errs
       then (Univ n)
       else XExpr (Nonsense (Right $ Univ (n + 1)) u)
-  Var t a -> do
+  Var (Const ()) a -> do
     varType <- asks (M.lookup a)
-    case t of
-      Just actual -> do
-        tFilled <- fillWithUVars actual
-        for_ varType (flip (tryUnify expr) (Right tFilled))
-        tryUnifyInferring expr expected tFilled
-      Nothing -> traverse_ (tryUnify expr (Right expected)) varType
+    traverse_ (tryUnify expr (Right expected)) varType
     pure (Var (Right expected) a)
   
 tryUnify :: Parsed -> Unifiable -> Unifiable -> TcM ()
@@ -194,14 +189,9 @@ tryUnifyInferring expr expt act = unifyInferring expt act <&> NE.nonEmpty >>= tr
 infer :: Parsed -> TcM Inferring
 infer expr = case expr of
   Univ n -> pure $ Univ n
-  Var mt a -> do
+  Var (Const ()) a -> do
     varT <- lookupVar a
-    case mt of
-      Nothing -> pure (Var varT a)
-      Just actual -> do
-        actualFilled <- Right <$> fillWithUVars actual
-        tryUnify expr varT actualFilled
-        pure (Var actualFilled a)
+    pure (Var varT a)
  
 typeOf :: Inferring -> Unifiable
 typeOf = \case
