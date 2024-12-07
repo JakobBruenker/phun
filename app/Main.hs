@@ -3,8 +3,7 @@
 
 module Main where
 
-import Control.Category ((>>>))
-import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks)
+import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, MonadWriter (listen))
 import Data.Functor.Identity (Identity)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
@@ -18,6 +17,8 @@ import Data.Text (Text)
 import GHC.Natural (Natural)
 import Data.Maybe (isNothing)
 import Control.Monad (when)
+import Data.Functor ((<&>))
+import Data.Foldable (traverse_, for_)
 
 type Parsed = Expr Maybe
 
@@ -27,12 +28,11 @@ type Inferring = Expr UVarOr
 
 type Unifiable = UVarOr Inferring
 
--- | Nonsense is an expression that didn't typecheck, but that has a certain type
-newtype Nonsense = Nonsense Inferring
+-- | Nonsense is an expression that didn't typecheck, but that has a certain type. Also carries the original expression.
+data Nonsense = Nonsense Inferring Parsed
 
 type Checked = Expr Identity
 
--- TODO remove?
 data SomeExpr
   = PExpr Parsed
   | IExpr Inferring
@@ -61,7 +61,7 @@ type family XXExpr f where
 data Error
   -- source expr, expected type, actual type
   -- TODO add source location
-  = TypeMismatch Parsed Inferring Inferring (NonEmpty UnificationFailure)
+  = TypeMismatch Parsed Unifiable Unifiable (NonEmpty UnificationFailure)
   | VarOutOfScope Id
 
 -- TODO add details
@@ -78,6 +78,9 @@ type DList a = Endo [a]
 
 emptyDList :: DList a
 emptyDList = Endo id
+
+nullDList :: DList a -> Bool
+nullDList (Endo f) = null (f [])
 
 silence :: TcM a -> TcM a
 silence = censor $ const emptyDList
@@ -121,6 +124,7 @@ unifyInferring (Univ n) (Univ n')
 -- Var t a == Var t' a' = t == t' && a == a'
 -- a == b = raise $ UnificationError (IExpr a) (IExpr b)
 
+-- TODO occurs check
 substUVar :: UVar -> Unifiable -> TcM ()
 substUVar v t = modify' \s -> s{subst = IM.insert v.id t s.subst}
 
@@ -158,27 +162,26 @@ fillWithUVars = \case
 -- TODO: termination checker
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
-  Univ n -> unifyInferring expected (Univ (n + 1)) >>= failOrSucceedWith (Univ n)
+  u@(Univ n) -> do
+    (_, errs) <- listen $ tryUnifyInferring expected (Univ (n + 1))
+    pure if nullDList errs
+      then (Univ n)
+      else XExpr (Nonsense (Univ (n + 1)) u)
   Var t a -> do
     varType <- asks (M.lookup a)
     case t of
       Just actual -> do
         tFilled <- fillWithUVars actual
-        varErrors <- maybe (pure []) (unify (Right tFilled)) varType
-        expectedErrors <- unifyInferring expected tFilled
-        -- TODO possibly don't combine these into one error
-        failOrSucceedWith (Var (Right expected) a) $ (varErrors ++ expectedErrors)
-      Nothing -> failOrSucceedWith (Var (Right expected) a) =<< maybe (pure []) (unify (Right expected)) varType
+        for_ varType (`tryUnify` (Right tFilled))
+        tryUnifyInferring expected tFilled
+      Nothing -> traverse_ (tryUnify (Right expected)) varType
+    pure (Var (Right expected) a)
   where 
-    failOrSucceedWith :: Inferring -> [UnificationFailure] -> TcM Inferring
-    failOrSucceedWith e = NE.nonEmpty >>> \case
-      Nothing -> pure e
-      Just f -> tcFail f
+    tryUnify :: Unifiable -> Unifiable -> TcM ()
+    tryUnify expt act = unify expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr expt act)
 
-    tcFail f = do
-      actual <- silence $ infer expr
-      raise $ TypeMismatch expr expected actual f
-      pure (XExpr $ Nonsense expected)
+    tryUnifyInferring :: Inferring -> Inferring -> TcM ()
+    tryUnifyInferring expt act = unifyInferring expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr (Right expt) (Right act))
 
 infer :: Parsed -> TcM Inferring
 infer = \case
