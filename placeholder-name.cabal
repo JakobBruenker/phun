@@ -19,8 +19,18 @@ common warnings
 executable placeholder-name
     import:           warnings
     main-is:          Main.hs
+    default-extensions: OverloadedStrings,
+                        StrictData,
+                        NoFieldSelectors,
+                        DuplicateRecordFields,
+                        OverloadedRecordDot,
+                        BlockArguments,
     -- other-modules:
     -- other-extensions:
-    build-depends:    base ^>=4.20.0.0
+    build-depends:    base ^>=4.20.0.0,
+                      text,
+                      mtl,
+                      containers,
+                      transformers,
     hs-source-dirs:   app
     default-language: GHC2024
