@@ -29,7 +29,7 @@ type Inferring = Expr UVarOr
 type Unifiable = UVarOr Inferring
 
 -- | Nonsense is an expression that didn't typecheck, but that has a certain type. Also carries the original expression.
-data Nonsense = Nonsense Inferring Parsed
+data Nonsense f = Nonsense (f (Expr f)) Parsed
 
 type Checked = Expr Identity
 
@@ -55,7 +55,7 @@ data DataConCan'tHappen deriving Show
 
 type family XXExpr f where
   XXExpr Maybe = DataConCan'tHappen
-  XXExpr (Either UVar) = Nonsense
+  XXExpr (Either UVar) = Nonsense (Either UVar)
   XXExpr Identity = DataConCan'tHappen
 
 data Error
@@ -65,7 +65,10 @@ data Error
   | VarOutOfScope Id
 
 -- TODO add details
-data UnificationFailure = UnificationFailure
+data UnificationFailure
+  = Can'tUnifyTypes Inferring Inferring
+  | Can'tUnifyVars Id Id
+  | Can'tUnifyLevels Natural Natural
 
 data TcState = TcState
   { nextUVar :: Int
@@ -92,7 +95,6 @@ lookupVar :: Id -> TcM Unifiable
 lookupVar i = do
   t <- asks (M.lookup i)
   when (isNothing t) . raise $ VarOutOfScope i
-  -- pure $ fromMaybe (Left (UVar 0)) t
   case t of
     Nothing -> do
       raise $ VarOutOfScope i
@@ -118,11 +120,17 @@ normalizeUnifiable = \case
   Right t -> pure (Right t)
 
 unifyInferring :: Inferring -> Inferring -> TcM [UnificationFailure]
-unifyInferring (Univ n) (Univ n')
-  | n == n' = pure []
-  | otherwise = pure [UnificationFailure]
--- Var t a == Var t' a' = t == t' && a == a'
--- a == b = raise $ UnificationError (IExpr a) (IExpr b)
+unifyInferring = \cases
+  (Univ n) (Univ n')
+    | n == n' -> pure []
+    | otherwise -> pure [Can'tUnifyLevels n n']
+  (Var t a) (Var t' a') -> ([Can'tUnifyVars a a' | a /= a'] ++) <$> unify t t'
+  -- If we have a nonsense expression, we must have already gotten a type error,
+  -- so there's no point in reporting that we can't unify Nonsense with
+  -- something. We still try to unify the kind, though
+  (XExpr (Nonsense t _)) t' -> unify t (typeOf t')
+  t (XExpr (Nonsense t' _)) -> unify (typeOf t) t'
+  t t' -> pure [Can'tUnifyTypes t t']
 
 -- TODO occurs check
 substUVar :: UVar -> Unifiable -> TcM ()
@@ -163,36 +171,47 @@ fillWithUVars = \case
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   u@(Univ n) -> do
-    (_, errs) <- listen $ tryUnifyInferring expected (Univ (n + 1))
+    (_, errs) <- listen $ tryUnifyInferring expr expected (Univ (n + 1))
     pure if nullDList errs
       then (Univ n)
-      else XExpr (Nonsense (Univ (n + 1)) u)
+      else XExpr (Nonsense (Right $ Univ (n + 1)) u)
   Var t a -> do
     varType <- asks (M.lookup a)
     case t of
       Just actual -> do
         tFilled <- fillWithUVars actual
-        for_ varType (`tryUnify` (Right tFilled))
-        tryUnifyInferring expected tFilled
-      Nothing -> traverse_ (tryUnify (Right expected)) varType
+        for_ varType (flip (tryUnify expr) (Right tFilled))
+        tryUnifyInferring expr expected tFilled
+      Nothing -> traverse_ (tryUnify expr (Right expected)) varType
     pure (Var (Right expected) a)
-  where 
-    tryUnify :: Unifiable -> Unifiable -> TcM ()
-    tryUnify expt act = unify expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr expt act)
+  
+tryUnify :: Parsed -> Unifiable -> Unifiable -> TcM ()
+tryUnify expr expt act = unify expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr expt act)
 
-    tryUnifyInferring :: Inferring -> Inferring -> TcM ()
-    tryUnifyInferring expt act = unifyInferring expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr (Right expt) (Right act))
+tryUnifyInferring :: Parsed -> Inferring -> Inferring -> TcM ()
+tryUnifyInferring expr expt act = unifyInferring expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr (Right expt) (Right act))
 
 infer :: Parsed -> TcM Inferring
-infer = \case
-  Univ n -> pure (Univ n)
-
-typeOf :: Inferring -> Inferring
+infer expr = case expr of
+  Univ n -> pure $ Univ n
+  Var mt a -> do
+    varT <- lookupVar a
+    case mt of
+      Nothing -> pure (Var varT a)
+      Just actual -> do
+        actualFilled <- Right <$> fillWithUVars actual
+        tryUnify expr varT actualFilled
+        pure (Var actualFilled a)
+ 
+typeOf :: Inferring -> Unifiable
 typeOf = \case
-  Univ n -> Univ (n + 1)
+  Univ n -> Right $ Univ (n + 1)
+  Var t _ -> t
+  XExpr (Nonsense t _) -> t
 
 eval :: Checked -> Checked
 eval u@(Univ _) = u
+eval v@(Var _ _) = v
 
 main :: IO ()
 main = putStrLn "Hello, Haskell!"
