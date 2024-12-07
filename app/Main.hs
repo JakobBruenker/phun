@@ -57,14 +57,23 @@ instance Show (f (Expr f p)) => Show (UExpr f p) where
 
 type Expr :: (Type -> Type) -> Pass -> Type
 data Expr f p where
+  Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
+
   Var :: Id -> Expr f p
   App :: (f (UExpr f p)) -> (f (UExpr f p)) -> Expr f p -- ^ NB: This is x f, not f x
-  Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
+
+  -- Technically, anything below can be encoded with the above
+  Void :: Expr f p
+  Unit :: Expr f p
+  TT :: Expr f p
 
 instance Show (f (UExpr f p)) => Show (Expr f p) where
   show (Var i) = show i
   show (App x f) = show x ++ " " ++ show f
   show (Nonsense e) = show e
+  show (Void) = "Void"
+  show (Unit) = "Unit"
+  show (TT) = "TT"
 
 data Error
   -- TODO add source location
@@ -78,6 +87,7 @@ data UnificationFailure
   | Can'tUnifyExprs InferringExpr InferringExpr
   | Can'tUnifyVars Id Id
   | Can'tUnifyLevels Natural Natural
+  | Can'tUnifyNonsense Parsed Parsed
 
 data TcState = TcState
   { nextUVar :: Int
@@ -133,9 +143,14 @@ instance Normalize InferringExpr where
   -- TODO we probably have to actually normalize the types here i.e. eval them, not just replace the UVars - Q: Can we ensure we only get normalizing terms here?
   normalize :: InferringExpr -> TcM InferringExpr
   normalize = \case
+    Nonsense e -> pure (Nonsense e)
+
     Var a -> pure (Var a)
     App x f -> App <$> normalize x <*>  normalize f
-    Nonsense e -> pure (Nonsense e)
+
+    Void -> pure Void
+    Unit -> pure Unit
+    TT -> pure TT
 
 instance Normalize u => Normalize (Typed PInferring u) where
   normalize :: Typed PInferring u -> TcM (Typed PInferring u)
@@ -160,11 +175,17 @@ class Unify a where
 instance Unify InferringExpr where
   unify :: InferringExpr -> InferringExpr -> TcM [UnificationFailure]
   unify = \cases
+    (Nonsense e) (Nonsense e') -> pure [Can'tUnifyNonsense e e']
+
     (Var a) (Var a') -> pure [Can'tUnifyVars a a' | a /= a']
     (App x f) (App x' f') -> do
       xErrs <- unify x x'
       fErrs <- unify f f'
       pure $ xErrs <> fErrs
+
+    Void Void -> pure []
+    Unit Unit -> pure []
+    TT TT -> pure []
     t t' -> pure [Can'tUnifyExprs t t']
 
 instance Unify u => Unify (Typed PInferring u) where
@@ -221,6 +242,10 @@ check expected expr = case expr of
       tryUnify expr expected varType
       pure $ Expr (Var a ::: expected)
     App x f -> undefined -- TODO
+
+    Void -> tryUnify expr expected (Univ 0) >> pure (Expr (Void ::: expected))
+    Unit -> tryUnify expr expected (Univ 0) >> pure (Expr (Unit ::: expected))
+    TT -> tryUnify expr expected (Expr (Unit ::: Univ 0)) >> pure (Expr (TT ::: expected))
   Hole -> UV <$> freshUVar -- XXX Is this right? It seems like we ignore the expected type. But maybe this will just always result in an unsolved uvar, which might be fine
   
 tryUnify :: Parsed -> Inferring -> Inferring -> TcM ()
@@ -234,14 +259,24 @@ infer expr = case expr of
       varT <- lookupVar a
       pure (Expr $ Var a ::: varT)
     App x f -> undefined -- TODO
+
+    Void -> pure (Expr $ Void ::: Univ 0)
+    Unit -> pure (Expr $ Unit ::: Univ 0)
+    TT -> pure (Expr $ TT ::: Expr (Unit ::: Univ 0))
   Hole -> UV <$> freshUVar
 
 eval :: Checked -> Checked
 eval = \case
   u@(Univ _) -> u
-  Expr (e ::: t) -> case e of
-    Var a -> Expr (Var a ::: t)
-    App x f -> undefined -- TODO
+  Expr (e ::: t) -> Expr (e' ::: t)
+    where
+      e' = case e of
+        Var a -> Var a
+        App x f -> undefined -- TODO
+
+        Void -> Void
+        Unit -> Unit
+        TT -> TT
 
 main :: IO ()
 main = putStrLn "Hello, Haskell!"
