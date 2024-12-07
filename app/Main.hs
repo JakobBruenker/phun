@@ -4,7 +4,7 @@
 module Main where
 
 import Control.Monad (when)
-import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks)
+import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Data.Foldable (traverse_)
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity (..))
@@ -19,10 +19,13 @@ import Data.Monoid (Endo(..))
 import Data.Text (Text)
 import GHC.Natural (Natural)
 import Data.Kind (Type)
+import Data.Function ((&))
 
 -- | LHS: Expr, RHS: Type
 type Typed :: Pass -> Type -> Type
 data Typed p e = e ::: UExpr (Typed p) p
+
+deriving instance Show e => Show (Typed f e)
 
 type Parsed = UExpr Identity PParsed
 
@@ -51,7 +54,7 @@ data UExpr f p where
 
 instance Show (f (Expr f p)) => Show (UExpr f p) where
   show (Univ n) = "Type" ++ show n
-  show (Expr e) = show e
+  show (Expr e) = "(" ++ show e ++ ")"
   show (UV u) = show u
   show Hole = "_"
 
@@ -69,7 +72,7 @@ data Expr f p where
 
 instance Show (f (UExpr f p)) => Show (Expr f p) where
   show (Var i) = show i
-  show (App x f) = show x ++ " " ++ show f
+  show (App x f) = (show x ++ " " ++ show f)
   show (Nonsense e) = show e
   show (Void) = "Void"
   show (Unit) = "Unit"
@@ -80,6 +83,7 @@ data Error
   = TypeMismatch Parsed Inferring Inferring (NonEmpty UnificationFailure)
   -- ^ source expr, expected type, actual type
   | VarOutOfScope Id
+  deriving Show
 
 -- TODO add details
 data UnificationFailure
@@ -88,6 +92,7 @@ data UnificationFailure
   | Can'tUnifyVars Id Id
   | Can'tUnifyLevels Natural Natural
   | Can'tUnifyNonsense Parsed Parsed
+  deriving Show
 
 data TcState = TcState
   { nextUVar :: Int
@@ -106,6 +111,9 @@ emptyDList = Endo id
 
 nullDList :: DList a -> Bool
 nullDList (Endo f) = null (f [])
+
+dListToList :: DList a -> [a]
+dListToList (Endo f) = f []
 
 silence :: TcM a -> TcM a
 silence = censor $ const emptyDList
@@ -206,7 +214,7 @@ instance Unify Inferring where
     where
       go :: Inferring -> Inferring -> TcM [UnificationFailure]
       go = \cases
-        (Univ n) (Univ n') -> pure [Can'tUnifyLevels n n']
+        (Univ n) (Univ n') -> pure [Can'tUnifyLevels n n' | n /= n']
         (UV u) (UV u')
           | u == u' -> pure []
           | otherwise -> substUVar u' (UV u) >> pure [] -- order doesn't really matter, but it seems reasonable to take the expected as "ground truth"
@@ -277,6 +285,10 @@ eval = \case
         Void -> Void
         Unit -> Unit
         TT -> TT
+
+runTcM :: TcM a -> (a, [Error])
+runTcM action = runRWS action M.empty (TcState 0 IM.empty) & \case
+  (a, _, w) -> (a, dListToList w)
 
 main :: IO ()
 main = putStrLn "Hello, Haskell!"
