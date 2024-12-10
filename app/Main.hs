@@ -5,12 +5,21 @@
 module Main where
 
 import Control.Monad (when, (>=>), join)
+import Control.Monad.Reader (Reader, MonadReader (..))
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Maybe (MaybeT(..))
+import Control.Monad.Trans.Writer.CPS (WriterT)
+import Control.Monad.Trans.Writer.CPS qualified as W
+import Data.Bifunctor (second)
+import Data.Char (chr, ord)
 import Data.Foldable (traverse_)
+import Data.Function ((&))
 import Data.Functor (($>))
 import Data.Functor.Identity (Identity (..))
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
+import Data.Kind (Type)
 import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
@@ -18,19 +27,10 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (isNothing)
 import Data.Monoid (Endo(..))
 import Data.Text (Text)
-import GHC.Natural (Natural)
-import Data.Kind (Type)
-import Data.Function ((&))
-import Data.Char (chr, ord)
-import qualified Data.Text as T
-import Control.Monad.Trans.Maybe (MaybeT(..))
-import Control.Monad.Reader (Reader, MonadReader (..))
-import Data.Void (Void, absurd)
 import Data.Type.Equality ((:~:) (..))
-import Control.Monad.Trans.Writer (WriterT)
-import Control.Monad.Trans.Writer qualified as W
-import Data.Bifunctor (second)
-import Control.Monad.Trans.Class (lift)
+import Data.Void (Void, absurd)
+import GHC.Natural (Natural)
+import qualified Data.Text as T
 
 -- | LHS: Expr, RHS: Type
 type Typed :: Pass -> Type -> Type
@@ -242,6 +242,8 @@ class Unify a where
   -- | Intended argument order: Expected, then actual
   unify' :: a -> a -> WriterT (DList UnificationFailure) TcM a
 
+-- TODO probably reduce here? To avoid trying to reduce on every recursive call of unify'
+-- TODO Q: What happens if e.g. in App we unify left side first, but actually right side contains information we need to successfully unify left side?
 unify :: Inferring -> Inferring -> TcM (Inferring, [UnificationFailure])
 unify e e' = second dListToList <$> W.runWriterT (unify' e e')
 
@@ -250,12 +252,12 @@ instance Unify InferringExpr where
     (Nonsense e) (Nonsense e') -> raiseUnif (Can'tUnifyNonsense e e') *> pure (Nonsense e)
 
     (Var a) (Var a') -> when (a /= a') (raiseUnif $ Can'tUnifyVars a a') *> pure (Var a)
-    (App x f) (App x' f') -> App <$> unify' x x' <*> unify' f f'
+    (App x f) (App x' f') -> App <$> unify' x x' <*> unify' f f' -- XXX Does the order in which we unify x vs f matter?
     (Pi x a b) (Pi x' a' b') -> do
-      v <- lift $ freshUnique Nothing
       a'' <- unify' a a'
+      u <- lift $ freshUnique Nothing
+      let uniq = Uniq u{tag = userName x}
       -- TODO do we need to add x, x' to the context?
-      let uniq = Uniq v{tag = userName x}
       b'' <- join $ unify' <$> lift (rename x uniq b) <*> lift (rename x' uniq b')
       pure $ Pi uniq a'' b''
 
@@ -270,14 +272,12 @@ instance Unify u => Unify (Typed PInferring u) where
     t'' <- unify' t t'
     pure $ t'' ::: k''
 
+
 instance Unify Inferring where
 -- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
   unify' = \cases
     (UV u) (UV u') | u == u' -> pure $ UV u -- minor optimization: Only look up uvars if necessary
-    u u' -> do
-      t <- lift $ normalize u
-      t' <- lift $ normalize u'
-      go t t'
+    u u' -> join $ go <$> lift (normalize u) <*> lift (normalize u')
     where
       go :: Inferring -> Inferring -> WriterT (DList UnificationFailure) TcM Inferring
       go = \cases
