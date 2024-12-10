@@ -24,6 +24,8 @@ import Data.Char (chr, ord)
 import qualified Data.Text as T
 import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Reader (Reader, MonadReader (..))
+import Data.Void (Void, absurd)
+import Data.Type.Equality ((:~:) (..))
 
 -- | LHS: Expr, RHS: Type
 type Typed :: Pass -> Type -> Type
@@ -40,7 +42,13 @@ type InferringExpr = Expr (Typed PInferring) PInferring
 type Checked = UExpr (Typed PChecked) PChecked
 
 -- | Unification Variables
-newtype UVar = UVar {id :: Int} deriving Eq
+type UVar' :: Pass -> Type
+data UVar' p where
+  UVar :: {id :: Int} -> UVar' PInferring
+
+type UVar = UVar' PInferring
+
+deriving instance Eq (UVar' p)
 
 instance Show UVar where
   show (UVar i) = "υ" ++ ['₋' | i < 0] ++  showNaturalSubscript (fromIntegral (abs i))
@@ -144,7 +152,7 @@ type Vars a = Map Id a
 -- | Typechecker monad.
 --
 -- Reader: Map from variable names to their types
-type TcM a = RWS (Vars Inferring) (DList Error) TcState a
+type TcM = RWS (Vars Inferring) (DList Error) TcState
 
 type DList a = Endo [a]
 
@@ -257,6 +265,7 @@ instance Unify u => Unify (Typed PInferring u) where
     pure $ kErrs <> tErrs
 
 -- TODO I feel like one issue is going to be that unify renames a var locally, assigns that renamed var to a uvar, and then we get confused once it's used outside. Maybe we need to keep track of the original name and use that for lookups, and the new name only for unification or something? but this might also require assigning a unique to *all* ids in the parsing step
+-- TODO possible solution? unify returns the altered expressions, or maybe even just one(!) altered expression, which is used instead of the original one
 instance Unify Inferring where
 -- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
   unify :: Inferring -> Inferring -> TcM [UnificationFailure]
@@ -401,23 +410,48 @@ infer expr = case expr of
     TT -> pure (Expr $ TT ::: Expr (Top ::: Univ 0))
   Hole -> UV <$> freshUVar
 
-eval :: Checked -> Reader (Vars Checked) Checked
-eval = \case
+class Eval p where
+  type PassMonad p :: Type -> Type
+  type UVarResult p :: Type
+  eval :: (m ~ PassMonad p, MonadReader (Vars e) m, e ~ UExpr (Typed p) p) => e -> m e
+  provideUVar :: UVar' p -> (PassMonad p) (UVarResult p)
+
+instance Eval PInferring where
+  type PassMonad PInferring = TcM
+  type UVarResult PInferring = Inferring
+  eval = eval' \case
+  provideUVar = normalizeUVar
+
+instance Eval PChecked where
+  type PassMonad PChecked = Reader (Vars Checked)
+  type UVarResult PChecked = Checked
+  eval = eval' \case
+  provideUVar = \case
+
+{-# SPECIALIZE eval' :: (PInferring :~: PParsed -> Void) -> Inferring -> TcM Inferring #-}
+{-# SPECIALIZE eval' :: (PChecked :~: PParsed -> Void) -> Checked -> Reader (Vars Checked) Checked #-}
+eval' :: (m ~ PassMonad p, MonadReader (Vars e) m, e ~ UExpr (Typed p) p) => (p :~: PParsed -> Void) -> e -> m e
+eval' notParsed = \case
   u@(Univ _) -> pure u
   Expr (e ::: t) -> do
     e' <- case e of
+      Nonsense e' -> pure $ Nonsense e'
+
       Var a -> pure $ Var a
       App x f -> undefined -- TODO
       Pi x a b -> do
-        a' <- eval a
-        b' <- withBinding x a' $ eval b
+        a' <- go a
+        b' <- withBinding x a' $ go b
         pure (Pi x a' b')
 
       Bottom -> pure Bottom
       Top -> pure Top
       TT -> pure TT
     pure $ Expr (e' ::: t)
-    where
+  UV u -> provideUVar u
+  Hole -> absurd $ notParsed Refl
+  where
+    go = eval' notParsed
 
 runTcM :: TcM a -> (a, [Error])
 runTcM action = runRWS action M.empty (TcState 0 0 IM.empty) & \case
