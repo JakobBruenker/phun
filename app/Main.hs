@@ -7,7 +7,7 @@ module Main where
 import Control.Monad (when, (>=>), join)
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Data.Foldable (traverse_)
-import Data.Functor ((<&>), ($>))
+import Data.Functor (($>))
 import Data.Functor.Identity (Identity (..))
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
@@ -27,6 +27,10 @@ import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Reader (Reader, MonadReader (..))
 import Data.Void (Void, absurd)
 import Data.Type.Equality ((:~:) (..))
+import Control.Monad.Trans.Writer (WriterT)
+import Control.Monad.Trans.Writer qualified as W
+import Data.Bifunctor (second)
+import Control.Monad.Trans.Class (lift)
 
 -- | LHS: Expr, RHS: Type
 type Typed :: Pass -> Type -> Type
@@ -170,7 +174,7 @@ silence :: TcM a -> TcM a
 silence = censor $ const emptyDList
 
 raise :: Error -> TcM ()
-raise e = tell $ Endo (e :)
+raise = tell . Endo . (:)
 
 lookupVar :: Id -> TcM Inferring
 lookupVar i = do
@@ -231,57 +235,60 @@ instance Normalize Inferring where
     Expr e -> Expr <$> normalize e
     UV v -> normalizeUVar v
 
+raiseUnif :: UnificationFailure -> WriterT (DList UnificationFailure) TcM ()
+raiseUnif = W.tell . Endo . (:)
+
 class Unify a where
   -- | Intended argument order: Expected, then actual
-  unify :: a -> a -> TcM ([UnificationFailure], a)
+  unify' :: a -> a -> WriterT (DList UnificationFailure) TcM a
+
+unify :: Inferring -> Inferring -> TcM (Inferring, [UnificationFailure])
+unify e e' = second dListToList <$> W.runWriterT (unify' e e')
 
 instance Unify InferringExpr where
-  unify = \cases
-    (Nonsense e) (Nonsense e') -> pure ([Can'tUnifyNonsense e e'], Nonsense e)
+  unify' = \cases
+    (Nonsense e) (Nonsense e') -> raiseUnif (Can'tUnifyNonsense e e') *> pure (Nonsense e)
 
-    (Var a) (Var a') -> pure ([Can'tUnifyVars a a' | a /= a'], Var a)
-    (App x f) (App x' f') -> do
-      (xErrs, x'') <- unify x x'
-      (fErrs, f'') <- unify f f'
-      pure (xErrs <> fErrs, App x'' f'')
+    (Var a) (Var a') -> when (a /= a') (raiseUnif $ Can'tUnifyVars a a') *> pure (Var a)
+    (App x f) (App x' f') -> App <$> unify' x x' <*> unify' f f'
     (Pi x a b) (Pi x' a' b') -> do
-      v <- freshUnique Nothing
-      (aErrs, a'') <- unify a a'
+      v <- lift $ freshUnique Nothing
+      a'' <- unify' a a'
       -- TODO do we need to add x, x' to the context?
       let uniq = Uniq v{tag = userName x}
-      (bErrs, b'') <- join $ unify <$> rename x uniq b <*> rename x' uniq b'
-      pure $ (aErrs <> bErrs, Pi uniq a'' b'')
+      b'' <- join $ unify' <$> lift (rename x uniq b) <*> lift (rename x' uniq b')
+      pure $ Pi uniq a'' b''
 
-    Bottom Bottom -> pure ([], Bottom)
-    Top Top -> pure ([], Top)
-    TT TT -> pure ([], TT)
-    t t' -> pure ([Can'tUnifyExprs t t'], t)
+    Bottom Bottom -> pure Bottom
+    Top Top -> pure Top
+    TT TT -> pure TT
+    t t' -> raiseUnif (Can'tUnifyExprs t t') *> pure t
 
 instance Unify u => Unify (Typed PInferring u) where
-  unify (t ::: k) (t' ::: k') = do
-    (kErrs, k'') <- unify k k'
-    (tErrs, t'') <- unify t t'
-    pure $ (kErrs <> tErrs, t'' ::: k'')
+  unify' (t ::: k) (t' ::: k') = do
+    k'' <- unify' k k'
+    t'' <- unify' t t'
+    pure $ t'' ::: k''
 
 instance Unify Inferring where
 -- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
-  unify = \cases
-    (UV u) (UV u') | u == u' -> pure ([], UV u) -- minor optimization: Only look up uvars if necessary
+  unify' = \cases
+    (UV u) (UV u') | u == u' -> pure $ UV u -- minor optimization: Only look up uvars if necessary
     u u' -> do
-      t <- normalize u
-      t' <- normalize u'
+      t <- lift $ normalize u
+      t' <- lift $ normalize u'
       go t t'
     where
-      go :: Inferring -> Inferring -> TcM ([UnificationFailure], Inferring)
+      go :: Inferring -> Inferring -> WriterT (DList UnificationFailure) TcM Inferring
       go = \cases
-        (Univ n) (Univ n') -> pure ([Can'tUnifyLevels n n' | n /= n'], Univ n)
+        (Univ n) (Univ n') -> when (n /= n) (raiseUnif $ Can'tUnifyLevels n n') *> pure (Univ n)
         (UV u) (UV u')
-          | u == u' -> pure ([], UV u)
-          | otherwise -> substUVar u' (UV u) >> pure ([], UV u) -- order doesn't really matter, but it seems reasonable to take the expected as "ground truth"
-        e (UV u') -> substUVar u' e >> pure ([], e)
-        (UV u) e -> substUVar u e >> pure ([], e)
-        (Expr t) (Expr t') -> fmap Expr <$> unify t t'
-        t t' -> pure ([Can'tUnifyTypes t t'], t)
+          | u == u' -> pure (UV u)
+          | otherwise -> lift (substUVar u' (UV u)) >> pure (UV u) -- order doesn't really matter, but it seems reasonable to take the expected as "ground truth"
+        e (UV u') -> lift (substUVar u' e) >> pure e
+        (UV u) e -> lift (substUVar u e) >> pure e
+        (Expr t) (Expr t') -> Expr <$> unify' t t'
+        t t' -> raiseUnif (Can'tUnifyTypes t t') *> pure t
 
 -- TODO occurs check
 substUVar :: UVar -> Inferring -> TcM ()
@@ -358,7 +365,7 @@ check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   Univ n -> do
     let uType = Univ (n + 1)
-    (errs, ty) <- unify expected $ Univ (n + 1)
+    (ty, errs) <- unify expected $ Univ (n + 1)
     case NE.nonEmpty errs of
       Nothing -> pure $ Univ n
       Just es -> do
@@ -378,7 +385,7 @@ check expected expr = case expr of
   
 tryUnify :: Parsed -> Inferring -> Inferring -> TcM Inferring
 tryUnify expr expt act = do
-  (errs, expr') <- unify expt act
+  (expr', errs) <- unify expt act
   traverse_ (raise . TypeMismatch expr expt act) (NE.nonEmpty errs) $> expr'
 
 level :: Inferring -> TcM (Maybe Natural)
