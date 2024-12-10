@@ -26,6 +26,7 @@ executable placeholder-name
                         OverloadedRecordDot,
                         BlockArguments,
                         MonadComprehensions,
+                        TypeAbstractions,
     -- other-modules:
     -- other-extensions:
     build-depends:    base ^>=4.20.0.0,

@@ -1,12 +1,13 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
 
 module Main where
 
-import Control.Monad (when, (>=>))
+import Control.Monad (when, (>=>), join)
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Data.Foldable (traverse_)
-import Data.Functor ((<&>))
+import Data.Functor ((<&>), ($>))
 import Data.Functor.Identity (Identity (..))
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
@@ -231,61 +232,56 @@ instance Normalize Inferring where
     UV v -> normalizeUVar v
 
 class Unify a where
-  -- | Intended argument order: Expected, then actual (order is only relevant for error reporting)
-  unify :: a -> a -> TcM [UnificationFailure]
+  -- | Intended argument order: Expected, then actual
+  unify :: a -> a -> TcM ([UnificationFailure], a)
 
 instance Unify InferringExpr where
-  unify :: InferringExpr -> InferringExpr -> TcM [UnificationFailure]
   unify = \cases
-    (Nonsense e) (Nonsense e') -> pure [Can'tUnifyNonsense e e']
+    (Nonsense e) (Nonsense e') -> pure ([Can'tUnifyNonsense e e'], Nonsense e)
 
-    (Var a) (Var a') -> pure [Can'tUnifyVars a a' | a /= a']
+    (Var a) (Var a') -> pure ([Can'tUnifyVars a a' | a /= a'], Var a)
     (App x f) (App x' f') -> do
-      xErrs <- unify x x'
-      fErrs <- unify f f'
-      pure $ xErrs <> fErrs
-    (Pi x t a) (Pi x' t' b) -> do
+      (xErrs, x'') <- unify x x'
+      (fErrs, f'') <- unify f f'
+      pure (xErrs <> fErrs, App x'' f'')
+    (Pi x a b) (Pi x' a' b') -> do
       v <- freshUnique Nothing
-      tErrs <- unify t t'
+      (aErrs, a'') <- unify a a'
       -- TODO do we need to add x, x' to the context?
-      a' <- rename x (Uniq v{tag = userName x}) a
-      b' <- rename x' (Uniq v{tag = userName x'}) b
-      eErrs <- unify a' b'
-      pure $ tErrs <> eErrs
+      let uniq = Uniq v{tag = userName x}
+      (bErrs, b'') <- join $ unify <$> rename x uniq b <*> rename x' uniq b'
+      pure $ (aErrs <> bErrs, Pi uniq a'' b'')
 
-    Bottom Bottom -> pure []
-    Top Top -> pure []
-    TT TT -> pure []
-    t t' -> pure [Can'tUnifyExprs t t']
+    Bottom Bottom -> pure ([], Bottom)
+    Top Top -> pure ([], Top)
+    TT TT -> pure ([], TT)
+    t t' -> pure ([Can'tUnifyExprs t t'], t)
 
 instance Unify u => Unify (Typed PInferring u) where
   unify (t ::: k) (t' ::: k') = do
-    kErrs <- unify k k'
-    tErrs <- unify t t'
-    pure $ kErrs <> tErrs
+    (kErrs, k'') <- unify k k'
+    (tErrs, t'') <- unify t t'
+    pure $ (kErrs <> tErrs, t'' ::: k'')
 
--- TODO I feel like one issue is going to be that unify renames a var locally, assigns that renamed var to a uvar, and then we get confused once it's used outside. Maybe we need to keep track of the original name and use that for lookups, and the new name only for unification or something? but this might also require assigning a unique to *all* ids in the parsing step
--- TODO possible solution? unify returns the altered expressions, or maybe even just one(!) altered expression, which is used instead of the original one
 instance Unify Inferring where
 -- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
-  unify :: Inferring -> Inferring -> TcM [UnificationFailure]
   unify = \cases
-    (UV u) (UV u') | u == u' -> pure [] -- minor optimization: Only look up uvars if necessary
+    (UV u) (UV u') | u == u' -> pure ([], UV u) -- minor optimization: Only look up uvars if necessary
     u u' -> do
       t <- normalize u
       t' <- normalize u'
       go t t'
     where
-      go :: Inferring -> Inferring -> TcM [UnificationFailure]
+      go :: Inferring -> Inferring -> TcM ([UnificationFailure], Inferring)
       go = \cases
-        (Univ n) (Univ n') -> pure [Can'tUnifyLevels n n' | n /= n']
+        (Univ n) (Univ n') -> pure ([Can'tUnifyLevels n n' | n /= n'], Univ n)
         (UV u) (UV u')
-          | u == u' -> pure []
-          | otherwise -> substUVar u' (UV u) >> pure [] -- order doesn't really matter, but it seems reasonable to take the expected as "ground truth"
-        e (UV u') -> substUVar u' e >> pure []
-        (UV u) e -> substUVar u e >> pure []
-        (Expr t) (Expr t') -> unify t t'
-        t t' -> pure [Can'tUnifyTypes t t']
+          | u == u' -> pure ([], UV u)
+          | otherwise -> substUVar u' (UV u) >> pure ([], UV u) -- order doesn't really matter, but it seems reasonable to take the expected as "ground truth"
+        e (UV u') -> substUVar u' e >> pure ([], e)
+        (UV u) e -> substUVar u e >> pure ([], e)
+        (Expr t) (Expr t') -> fmap Expr <$> unify t t'
+        t t' -> pure ([Can'tUnifyTypes t t'], t)
 
 -- TODO occurs check
 substUVar :: UVar -> Inferring -> TcM ()
@@ -362,26 +358,28 @@ check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   Univ n -> do
     let uType = Univ (n + 1)
-    errs <- unify expected uType
+    (errs, ty) <- unify expected $ Univ (n + 1)
     case NE.nonEmpty errs of
       Nothing -> pure $ Univ n
       Just es -> do
         raise $ TypeMismatch expr expected uType es
-        pure $ Expr (Nonsense expr ::: expected)
+        pure $ Expr (Nonsense expr ::: ty)
   Expr (Identity e) -> case e of
     Var a -> do
       varType <- lookupVar a
-      tryUnify expr expected varType
-      pure $ Expr (Var a ::: expected)
+      ty <- tryUnify expr expected varType
+      pure $ Expr (Var a ::: ty)
     App x f -> undefined -- TODO
 
-    Bottom -> tryUnify expr expected (Univ 0) >> pure (Expr (Bottom ::: expected))
-    Top -> tryUnify expr expected (Univ 0) >> pure (Expr (Top ::: expected))
-    TT -> tryUnify expr expected (Expr (Top ::: Univ 0)) >> pure (Expr (TT ::: expected))
-  Hole -> UV <$> freshUVar -- XXX Is this right? It seems like we ignore the expected type. But maybe this will just always result in an unsolved uvar, which might be fine
+    Bottom -> Expr . (Bottom :::) <$> tryUnify expr expected (Univ 0)
+    Top -> Expr . (Top :::) <$> tryUnify expr expected (Univ 0)
+    TT -> Expr . (TT :::) <$> tryUnify expr expected (Expr (Top ::: Univ 0))
+  Hole -> UV <$> freshUVar -- XXX Is this right? It seems like we ignore the expected type. But maybe this will just always result in an unsolved uvar, which might be fine. Otherwise, possibly UVars need to be able to optionally have types
   
-tryUnify :: Parsed -> Inferring -> Inferring -> TcM ()
-tryUnify expr expt act = unify expt act <&> NE.nonEmpty >>= traverse_ (raise . TypeMismatch expr expt act)
+tryUnify :: Parsed -> Inferring -> Inferring -> TcM Inferring
+tryUnify expr expt act = do
+  (errs, expr') <- unify expt act
+  traverse_ (raise . TypeMismatch expr expt act) (NE.nonEmpty errs) $> expr'
 
 level :: Inferring -> TcM (Maybe Natural)
 level = \case
@@ -415,25 +413,29 @@ class Eval p where
   type UVarResult p :: Type
   eval :: (m ~ PassMonad p, MonadReader (Vars e) m, e ~ UExpr (Typed p) p) => e -> m e
   provideUVar :: UVar' p -> (PassMonad p) (UVarResult p)
+  evalTypes :: Bool
 
 instance Eval PInferring where
   type PassMonad PInferring = TcM
   type UVarResult PInferring = Inferring
   eval = eval' \case
   provideUVar = normalizeUVar
+  evalTypes = True
 
 instance Eval PChecked where
   type PassMonad PChecked = Reader (Vars Checked)
   type UVarResult PChecked = Checked
   eval = eval' \case
   provideUVar = \case
+  evalTypes = False
 
 {-# SPECIALIZE eval' :: (PInferring :~: PParsed -> Void) -> Inferring -> TcM Inferring #-}
 {-# SPECIALIZE eval' :: (PChecked :~: PParsed -> Void) -> Checked -> Reader (Vars Checked) Checked #-}
-eval' :: (m ~ PassMonad p, MonadReader (Vars e) m, e ~ UExpr (Typed p) p) => (p :~: PParsed -> Void) -> e -> m e
-eval' notParsed = \case
+eval' :: (Eval p, m ~ PassMonad p, MonadReader (Vars e) m, e ~ UExpr (Typed p) p) => (p :~: PParsed -> Void) -> e -> m e
+eval' @p notParsed = \case
   u@(Univ _) -> pure u
   Expr (e ::: t) -> do
+    t' <- if evalTypes @p then go t else pure t
     e' <- case e of
       Nonsense e' -> pure $ Nonsense e'
 
@@ -447,7 +449,7 @@ eval' notParsed = \case
       Bottom -> pure Bottom
       Top -> pure Top
       TT -> pure TT
-    pure $ Expr (e' ::: t)
+    pure $ Expr (e' ::: t')
   UV u -> provideUVar u
   Hole -> absurd $ notParsed Refl
   where
