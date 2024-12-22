@@ -134,6 +134,8 @@ data Error
   -- TODO add source location
   = TypeMismatch Parsed Inferring Inferring (NonEmpty UnificationFailure)
   -- ^ source expr, expected type, actual type
+  | LevelMismatch Parsed Natural Natural
+  -- ^ source expr, expected level, actual level
   | VarOutOfScope Id
   deriving Show
 
@@ -252,7 +254,8 @@ instance Unify InferringExpr where
     (Nonsense e) (Nonsense e') -> raiseUnif (Can'tUnifyNonsense e e') *> pure (Nonsense e)
 
     (Var a) (Var a') -> when (a /= a') (raiseUnif $ Can'tUnifyVars a a') *> pure (Var a)
-    (App x f) (App x' f') -> App <$> unify' x x' <*> unify' f f' -- XXX Does the order in which we unify x vs f matter?
+    -- TODO: for app we might want to only try to unify f and x if one of the f's is fully reduced (no uvars) - keep has uvars flag in uexpr?
+    (App x f) (App x' f') -> App <$> unify' x x' <*> unify' f f' -- XXX Does the order in which we unify x vs f matter? (probably not if ^ TODO is implemented)
     (Pi x a b) (Pi x' a' b') -> do
       a'' <- unify' a a'
       u <- lift $ freshUnique Nothing
@@ -377,6 +380,17 @@ check expected expr = case expr of
       ty <- tryUnify expr expected varType
       pure $ Expr (Var a ::: ty)
     App x f -> undefined -- TODO
+    Pi x a b -> do
+      a' <- infer a
+      b' <- withBinding x a' $ infer b
+      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
+      case expected of
+        Univ n -> do
+          when (lvl /= n) $ raise $ LevelMismatch expr n lvl
+          pure $ Expr (Pi x a' b' ::: Univ n)
+        _ -> do
+          raise $ TypeMismatch expr expected (Univ lvl) (Can'tUnifyTypes expected (Univ lvl) NE.:| [])
+          pure $ Expr (Nonsense expr ::: expected)
 
     Bottom -> Expr . (Bottom :::) <$> tryUnify expr expected (Univ 0)
     Top -> Expr . (Top :::) <$> tryUnify expr expected (Univ 0)
@@ -388,13 +402,14 @@ tryUnify expr expt act = do
   (expr', errs) <- unify expt act
   traverse_ (raise . TypeMismatch expr expt act) (NE.nonEmpty errs) $> expr'
 
-level :: Inferring -> TcM (Maybe Natural)
-level = \case
+inferLevel :: Inferring -> TcM (Maybe Natural)
+inferLevel = \case
   Univ n -> pure $ Just n
-  Expr (_ ::: t) -> runMaybeT [ l - 1 | l <- MaybeT (level t), l > 0 ]
+  Expr (_ ::: t) -> runMaybeT [ l - 1 | l <- MaybeT (inferLevel t), l > 0 ]
   UV u -> normalizeUVar u >>= \case
+    -- XXX what actually happens though if this uvar is later filled with something that has a higher level? Seems problematic. We might need a max or exact level on uvars
     UV _ -> pure Nothing -- Users might need to specify levels for universes if they're higher than 0
-    t -> level t
+    t -> inferLevel t
 
 infer :: Parsed -> TcM Inferring
 infer expr = case expr of
@@ -407,7 +422,7 @@ infer expr = case expr of
     Pi x a b -> do
       a' <- infer a
       b' <- withBinding x a' $ infer b
-      lvl <- maybe 0 (+1) <$> (max <$> level a' <*> level b')
+      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       pure (Expr $ Pi x a' b' ::: Univ lvl)
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)
