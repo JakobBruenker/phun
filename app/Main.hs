@@ -36,7 +36,7 @@ import qualified Data.Text as T
 type Typed :: Pass -> Type -> Type
 data Typed p e = e ::: UExpr (Typed p) p
 
-deriving instance Show e => Show (Typed f e)
+deriving instance Show e => Show (Typed p e)
 
 type Parsed = UExpr Identity PParsed
 
@@ -111,20 +111,22 @@ data Expr f p where
   Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
 
   Var :: Id -> Expr f p
-  App :: (UExpr f p) -> (UExpr f p) -> Expr f p -- ^ NB: This is x f, not f x
-  Pi :: Id -> (UExpr f p) -> (UExpr f p) -> Expr f p
+  App :: UExpr f p -> UExpr f p -> Expr f p -- ^ NB: This is x f, not f x
+  Pi :: Id -> UExpr f p -> UExpr f p -> Expr f p
+  Lam :: Id -> UExpr f p -> Expr f p
 
   -- Technically, anything below can be encoded with the above
   Bottom :: Expr f p
   Top :: Expr f p
   TT :: Expr f p
 
-instance Show (f (Expr f p)) => Show (Expr f p) where
+instance (Show (f (Expr f p))) => Show (Expr f p) where
   show (Nonsense e) = show e
 
   show (Var i) = show i
   show (App x f) = ("(" ++ show x ++ " " ++ show f ++ ")")
   show (Pi i t b) = "Π" ++ show i ++ ":" ++ show t ++ "." ++ show b
+  show (Lam i b) = "λ" ++ show i ++ "." ++ show b
 
   show (Bottom) = "⊥"
   show (Top) = "⊤"
@@ -137,6 +139,8 @@ data Error
   | LevelMismatch Parsed Natural Natural
   -- ^ source expr, expected level, actual level
   | VarOutOfScope Id
+  | NoTypeForUVar UVar
+  | NoLevelForUVar UVar
   deriving Show
 
 -- TODO add details
@@ -178,8 +182,8 @@ silence = censor $ const emptyDList
 raise :: Error -> TcM ()
 raise = tell . Endo . (:)
 
-lookupVar :: Id -> TcM Inferring
-lookupVar i = do
+lookupVarType :: Id -> TcM Inferring
+lookupVarType i = do
   t <- asks (M.lookup i)
   when (isNothing t) . raise $ VarOutOfScope i
   case t of
@@ -201,6 +205,7 @@ normalizeUVar v = do
     Just (UV v') -> normalizeUVar v' -- TODO maybe zonk in this case
     Just t' -> pure t'
 
+-- This is a little confusing because it's used to bind a type while inferring, but to bind a term while evaluating
 withBinding :: MonadReader (Vars v) m => Id -> v -> m a -> m a
 withBinding i t = local (M.insert i t)
 
@@ -216,6 +221,7 @@ instance Normalize InferringExpr where
     Var a -> pure (Var a)
     App x f -> App <$> normalize x <*>  normalize f
     Pi i t b -> Pi i <$> normalize t <*> normalize b
+    Lam i b -> Lam i <$> normalize b
 
     Bottom -> pure Bottom
     Top -> pure Top
@@ -278,6 +284,7 @@ instance Unify u => Unify (Typed PInferring u) where
 
 instance Unify Inferring where
 -- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
+-- TODO I think TcM actually needs to keep track of both Var terms and Var types (for Pi and Lam binders), since if we're evalling deep in a term we need to be able to access bindings from further out
   unify' = \cases
     (UV u) (UV u') | u == u' -> pure $ UV u -- minor optimization: Only look up uvars if necessary
     u u' -> join $ go <$> lift (normalize u) <*> lift (normalize u')
@@ -328,6 +335,7 @@ instance Zonk InferringExpr where
     Var a -> pure (Var a)
     App x f -> App <$> zonk x <*> zonk f
     Pi i t b -> Pi i <$> zonk t <*> zonk b
+    Lam i b -> Lam i <$> zonk b
 
     Bottom -> pure Bottom
     Top -> pure Top
@@ -342,7 +350,12 @@ instance Rename InferringExpr where
 
     Var a -> pure (Var (if a == orig then new else a))
     App x f -> App <$> rename' orig new x <*> rename' orig new f
-    Pi i t b -> Pi i <$> rename' orig new t <*> rename' orig new b
+    Pi i t b
+      | i == orig -> pure $ Pi i t b
+      | otherwise -> Pi i <$> rename' orig new t <*> rename' orig new b
+    Lam i b
+      | i == orig -> pure $ Lam i b
+      | otherwise -> Lam i <$> rename' orig new b
 
     Bottom -> pure Bottom
     Top -> pure Top
@@ -376,7 +389,7 @@ check expected expr = case expr of
         pure $ Expr (Nonsense expr ::: ty)
   Expr (Identity e) -> case e of
     Var a -> do
-      varType <- lookupVar a
+      varType <- lookupVarType a
       ty <- tryUnify expr expected varType
       pure $ Expr (Var a ::: ty)
     App x f -> undefined -- TODO
@@ -384,13 +397,24 @@ check expected expr = case expr of
       a' <- infer a
       b' <- withBinding x a' $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
-      case expected of
-        Univ n -> do
-          when (lvl /= n) $ raise $ LevelMismatch expr n lvl
-          pure $ Expr (Pi x a' b' ::: Univ n)
-        _ -> do
-          raise $ TypeMismatch expr expected (Univ lvl) (Can'tUnifyTypes expected (Univ lvl) NE.:| [])
-          pure $ Expr (Nonsense expr ::: expected)
+      (ty, errs) <- unify expected (Univ lvl)
+      case NE.nonEmpty errs of
+        Nothing -> pure $ Expr (Pi x a' b' ::: ty)
+        Just es -> do
+          raise $ TypeMismatch expr expected (Univ lvl) es
+          pure $ Expr (Nonsense expr ::: ty)
+    Lam x rhs -> do
+      a <- UV <$> freshUVar
+      b <- UV <$> freshUVar
+      k <- UV <$> freshUVar
+      (ty, errs) <- unify expected $ Expr (Pi x a b ::: k)
+      case NE.nonEmpty errs of
+        Nothing -> do
+          rhs' <- withBinding x a $ check b rhs
+          pure $ Expr (Lam x rhs' ::: ty)
+        Just es -> do
+          raise $ TypeMismatch expr expected (Expr (Pi x a b ::: k)) es
+          pure $ Expr (Nonsense expr ::: ty)
 
     Bottom -> Expr . (Bottom :::) <$> tryUnify expr expected (Univ 0)
     Top -> Expr . (Top :::) <$> tryUnify expr expected (Univ 0)
@@ -407,8 +431,11 @@ inferLevel = \case
   Univ n -> pure $ Just n
   Expr (_ ::: t) -> runMaybeT [ l - 1 | l <- MaybeT (inferLevel t), l > 0 ]
   UV u -> normalizeUVar u >>= \case
-    -- XXX what actually happens though if this uvar is later filled with something that has a higher level? Seems problematic. We might need a max or exact level on uvars
-    UV _ -> pure Nothing -- Users might need to specify levels for universes if they're higher than 0
+    -- TODO maybe we can get away with not throwing an error here if we store a min/max level in a UVar (...and maybe make it cumulative to play nice with Pi's max...)
+    -- TODO could also say Univ can optionally take a set of UVars and has to have the max level of those + 1 (plus an optional min level)
+    UV u -> do
+      raise $ NoLevelForUVar u
+      pure Nothing
     t -> inferLevel t
 
 infer :: Parsed -> TcM Inferring
@@ -416,19 +443,35 @@ infer expr = case expr of
   Univ n -> pure $ Univ n
   Expr (Identity e) -> case e of
     Var a -> do
-      varT <- lookupVar a
+      varT <- lookupVarType a
       pure (Expr $ Var a ::: varT)
+    -- TODO note, one interesting thing is if you have `x y f`, if you can look up the type of `f`, you can now transition into checking mode
     App x f -> undefined -- TODO
     Pi x a b -> do
       a' <- infer a
       b' <- withBinding x a' $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       pure (Expr $ Pi x a' b' ::: Univ lvl)
+    Lam x b -> do
+      a <- UV <$> freshUVar
+      b' <- withBinding x a $ infer b
+      bt <- typeOf b'
+      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel bt)
+      -- XXX hmm if we have the type 'a in the Pi type anyway, do we really need it in Lam?
+      pure (Expr $ Lam x b' ::: Expr (Pi x a bt ::: Univ lvl))
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)
     Top -> pure (Expr $ Top ::: Univ 0)
     TT -> pure (Expr $ TT ::: Expr (Top ::: Univ 0))
   Hole -> UV <$> freshUVar
+
+typeOf :: Inferring -> TcM Inferring
+typeOf = \case
+  Univ n -> pure $ Univ (n + 1)
+  Expr (_ ::: t) -> pure t
+  UV u -> do
+    raise $ NoTypeForUVar u -- TODO maybe it makes sense if uvars have an optional type, so we don't have to error here (but can return a uvar)?
+    infer Hole
 
 class Eval p where
   type PassMonad p :: Type -> Type
@@ -461,12 +504,13 @@ eval' @p notParsed = \case
     e' <- case e of
       Nonsense e' -> pure $ Nonsense e'
 
-      Var a -> pure $ Var a
+      Var a -> pure $ Var a -- TODO look up var
       App x f -> undefined -- TODO
       Pi x a b -> do
         a' <- go a
         b' <- withBinding x a' $ go b
         pure (Pi x a' b')
+      Lam x b -> Lam x <$> go b
 
       Bottom -> pure Bottom
       Top -> pure Top
