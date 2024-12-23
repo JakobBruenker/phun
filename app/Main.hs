@@ -5,11 +5,11 @@
 module Main where
 
 import Control.Monad (when, (>=>), join)
-import Control.Monad.Reader (Reader, MonadReader (..))
+import Control.Monad.Reader (MonadReader (..))
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..))
-import Control.Monad.Trans.Writer.CPS (WriterT)
+import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT)
 import Control.Monad.Trans.Writer.CPS qualified as W
 import Data.Bifunctor (second)
 import Data.Char (chr, ord)
@@ -24,8 +24,8 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (isNothing)
-import Data.Monoid (Endo(..))
+import Data.Maybe (isNothing, fromMaybe)
+import Data.Monoid (Endo(..), Any (..))
 import Data.Text (Text)
 import Data.Type.Equality ((:~:) (..))
 import Data.Void (Void, absurd)
@@ -205,7 +205,7 @@ normalizeUVar v = do
     Just (UV v') -> normalizeUVar v' -- TODO maybe zonk in this case
     Just t' -> pure t'
 
--- This is a little confusing because it's used to bind a type while inferring, but to bind a term while evaluating
+-- | Add a binding to the context reprsenting the type of a variable
 withBinding :: MonadReader (Vars v) m => Id -> v -> m a -> m a
 withBinding i t = local (M.insert i t)
 
@@ -285,6 +285,7 @@ instance Unify u => Unify (Typed PInferring u) where
 instance Unify Inferring where
 -- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
 -- TODO I think TcM actually needs to keep track of both Var terms and Var types (for Pi and Lam binders), since if we're evalling deep in a term we need to be able to access bindings from further out
+    --  Wait that might not be true, because we only introduce new terms when evalling App, and then at the end of eval all vars should be replaced I think
   unify' = \cases
     (UV u) (UV u') | u == u' -> pure $ UV u -- minor optimization: Only look up uvars if necessary
     u u' -> join $ go <$> lift (normalize u) <*> lift (normalize u')
@@ -473,53 +474,65 @@ typeOf = \case
     raise $ NoTypeForUVar u -- TODO maybe it makes sense if uvars have an optional type, so we don't have to error here (but can return a uvar)?
     infer Hole
 
-class Eval p where
+class Monad (PassMonad p) => Eval p where
   type PassMonad p :: Type -> Type
   type UVarResult p :: Type
-  eval :: (m ~ PassMonad p, MonadReader (Vars e) m, e ~ UExpr (Typed p) p) => e -> m e
   provideUVar :: UVar' p -> (PassMonad p) (UVarResult p)
   evalTypes :: Bool
+  notParsed :: p :~: PParsed -> Void
+
+-- | Step through a single pass of the typechecker and return the new expression and whether it was reduced
+step :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> m (e, Bool)
+step = (fmap . second) getAny . runWriterT . step' M.empty
+
+eval :: (Monad (PassMonad p), Eval p) => (e ~ UExpr (Typed p) p) => e -> PassMonad p e
+eval e = do
+  (e', wasReduced) <- step e
+  if wasReduced then eval e' else pure e'
 
 instance Eval PInferring where
   type PassMonad PInferring = TcM
   type UVarResult PInferring = Inferring
-  eval = eval' \case
   provideUVar = normalizeUVar
   evalTypes = True
+  notParsed = \case
 
 instance Eval PChecked where
-  type PassMonad PChecked = Reader (Vars Checked)
+  type PassMonad PChecked = Identity
   type UVarResult PChecked = Checked
-  eval = eval' \case
   provideUVar = \case
   evalTypes = False
+  notParsed = \case
 
-{-# SPECIALIZE eval' :: (PInferring :~: PParsed -> Void) -> Inferring -> TcM Inferring #-}
-{-# SPECIALIZE eval' :: (PChecked :~: PParsed -> Void) -> Checked -> Reader (Vars Checked) Checked #-}
-eval' :: (Eval p, m ~ PassMonad p, MonadReader (Vars e) m, e ~ UExpr (Typed p) p) => (p :~: PParsed -> Void) -> e -> m e
-eval' @p notParsed = \case
+{-# SPECIALIZE step' :: Vars Inferring -> Inferring -> WriterT Any TcM Inferring #-}
+{-# SPECIALIZE step' :: Vars Checked -> Checked -> WriterT Any Identity Checked #-}
+step' :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => Vars e -> e -> WriterT Any m e
+step' @p vars = \case
   u@(Univ _) -> pure u
   Expr (e ::: t) -> do
     t' <- if evalTypes @p then go t else pure t
-    e' <- case e of
-      Nonsense e' -> pure $ Nonsense e'
+    let withType x = Expr (x ::: t')
+    e' :: UExpr (Typed p) p <- case e of
+      Nonsense e' -> pure . withType $ Nonsense e'
 
-      Var a -> pure $ Var a -- TODO look up var
+      Var a -> pure $ fromMaybe (withType $ Var a) $ vars M.!? a
       App x f -> undefined -- TODO
       Pi x a b -> do
         a' <- go a
-        b' <- withBinding x a' $ go b
-        pure (Pi x a' b')
-      Lam x b -> Lam x <$> go b
+        b' <- go b
+        pure . withType $ Pi x a' b'
+      Lam x b -> withType . Lam x <$> go b
 
-      Bottom -> pure Bottom
-      Top -> pure Top
-      TT -> pure TT
-    pure $ Expr (e' ::: t')
-  UV u -> provideUVar u
+      Bottom -> pure . withType $ Bottom
+      Top -> pure . withType $ Top
+      TT -> pure . withType $ TT
+    pure e'
+  UV u -> lift (provideUVar u)
   Hole -> absurd $ notParsed Refl
   where
-    go = eval' notParsed
+    go = step' vars
+    -- TODO could warn about shadowing
+    goWith v e = step' (M.insert v e vars)
 
 runTcM :: TcM a -> (a, [Error])
 runTcM action = runRWS action M.empty (TcState 0 0 IM.empty) & \case
