@@ -259,7 +259,15 @@ instance Unify InferringExpr where
   unify' = \cases
     (Nonsense e) (Nonsense e') -> raiseUnif (Can'tUnifyNonsense e e') *> pure (Nonsense e)
 
-    (Var a) (Var a') -> when (a /= a') (raiseUnif $ Can'tUnifyVars a a') *> pure (Var a)
+    (Var a) (Var a') -> when (a /= a') (raiseUnif $ Can'tUnifyVars a a') *> pure (Var $ combine a a')
+      where
+        -- We prefer to use vars with more information, or else the expected Var
+        combine = \cases
+          u@(Uniq (Unique _ (Just _))) _ -> u
+          u@(Name _) _ -> u
+          _ u'@(Uniq (Unique _ (Just _))) -> u'
+          u _ -> u
+
     -- TODO: for app we might want to only try to unify f and x if one of the f's is fully reduced (no uvars) - keep has uvars flag in uexpr?
     (App x f) (App x' f') -> App <$> unify' x x' <*> unify' f f' -- XXX Does the order in which we unify x vs f matter? (probably not if ^ TODO is implemented)
     (Pi x a b) (Pi x' a' b') -> do
@@ -378,6 +386,7 @@ rename :: (Rename a, Zonk a) => Id -> Id -> a -> TcM a
 rename orig new = zonk >=> rename' orig new
 
 -- TODO: termination checker
+-- | Check takes a type and a parsed expression that is expected to have that type
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   Univ n -> do
@@ -393,7 +402,14 @@ check expected expr = case expr of
       varType <- lookupVarType a
       ty <- tryUnify expr expected varType
       pure $ Expr (Var a ::: ty)
-    App x f -> undefined -- TODO
+    App x f -> do
+      i <- Uniq <$> freshUnique Nothing
+      a <- UV <$> freshUVar
+      k <- UV <$> freshUVar
+      f' <- check (Expr (Pi i a expected ::: k)) f
+      x' <- check a x
+      -- TODO oh no we actually do need the value of x here in the Reader
+      undefined
     Pi x a b -> do
       a' <- infer a
       b' <- withBinding x a' $ infer b
@@ -434,11 +450,12 @@ inferLevel = \case
   UV u -> normalizeUVar u >>= \case
     -- TODO maybe we can get away with not throwing an error here if we store a min/max level in a UVar (...and maybe make it cumulative to play nice with Pi's max...)
     -- TODO could also say Univ can optionally take a set of UVars and has to have the max level of those + 1 (plus an optional min level)
-    UV u -> do
-      raise $ NoLevelForUVar u
+    UV u' -> do
+      raise $ NoLevelForUVar u'
       pure Nothing
     t -> inferLevel t
 
+-- infer should not use unify, and instead call check.
 infer :: Parsed -> TcM Inferring
 infer expr = case expr of
   Univ n -> pure $ Univ n
@@ -446,8 +463,14 @@ infer expr = case expr of
     Var a -> do
       varT <- lookupVarType a
       pure (Expr $ Var a ::: varT)
-    -- TODO note, one interesting thing is if you have `x y f`, if you can look up the type of `f`, you can now transition into checking mode
-    App x f -> undefined -- TODO
+    App x f -> do
+      a <- UV <$> freshUVar
+      b <- UV <$> freshUVar
+      i <- Uniq <$> freshUnique Nothing
+      k <- UV <$> freshUVar
+      f' <- check (Expr (Pi i a b ::: k)) f
+      x' <- check a x
+      pure (Expr $ App x' f' ::: b)
     Pi x a b -> do
       a' <- infer a
       b' <- withBinding x a' $ infer b
@@ -515,7 +538,9 @@ step' @p vars = \case
     e' :: UExpr (Typed p) p <- case e of
       Nonsense e' -> pure . withType $ Nonsense e'
 
-      Var a -> pure $ fromMaybe (withType $ Var a) $ vars M.!? a
+      Var a -> maybe (pure . withType $ Var a) (\v -> tellHasReduced *> go v) $ vars M.!? a
+      -- TODO I think x has to be fully reduced before we do beta reduction. Reason: Otherwise variables in x might be shadowed in places where they're used in f
+      -- TODO alternatively we could make sure that all vars are replaced by uniques before we get here
       App x f -> undefined -- TODO
       Pi x a b -> do
         a' <- go a
@@ -531,8 +556,8 @@ step' @p vars = \case
   Hole -> absurd $ notParsed Refl
   where
     go = step' vars
-    -- TODO could warn about shadowing
-    goWith v e = step' (M.insert v e vars)
+    goWith v e = step' (M.insert v e vars) -- TODO could warn about shadowing
+    tellHasReduced = tell (Any True)
 
 runTcM :: TcM a -> (a, [Error])
 runTcM action = runRWS action M.empty (TcState 0 0 IM.empty) & \case
