@@ -27,6 +27,7 @@ executable placeholder-name
                         BlockArguments,
                         MonadComprehensions,
                         TypeAbstractions,
+                        ViewPatterns,
     -- other-modules:
     -- other-extensions:
     build-depends:    base ^>=4.20.0.0,
@@ -34,5 +35,6 @@ executable placeholder-name
                       mtl,
                       containers,
                       transformers,
+                      comonad,
     hs-source-dirs:   app
     default-language: GHC2024

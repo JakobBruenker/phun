@@ -5,12 +5,11 @@
 module Main where
 
 import Control.Monad (when, (>=>), join)
-import Control.Monad.Reader (MonadReader (..), Reader)
+import Control.Monad.Reader (MonadReader (..))
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..))
-import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, mapWriterT)
-import Control.Monad.Trans.Writer.CPS qualified as W
+import Control.Monad.Trans.Writer.CPS (WriterT, Writer, listen, runWriterT)
 import Data.Bifunctor (second)
 import Data.Char (chr, ord)
 import Data.Foldable (traverse_)
@@ -30,10 +29,16 @@ import Data.Type.Equality ((:~:) (..))
 import Data.Void (Void, absurd)
 import GHC.Natural (Natural)
 import qualified Data.Text as T
+import Control.Comonad (Comonad (..))
+import Data.Maybe (isJust)
 
 -- | LHS: Expr, RHS: Type
 type Typed :: Pass -> Type -> Type
-data Typed p e = e ::: UExpr (Typed p) p
+data Typed p e = e ::: UExpr (Typed p) p deriving Functor
+
+instance Comonad (Typed p) where
+  extract (e ::: _) = e
+  duplicate (e ::: t) = ((e ::: t) ::: t)
 
 deriving instance Show e => Show (Typed p e)
 
@@ -149,6 +154,7 @@ data UnificationFailure
   | Can'tUnifyVars Id Id
   | Can'tUnifyLevels Natural Natural
   | Can'tUnifyNonsense Parsed Parsed
+  | Can'tUnifyUVarInApp Inferring
   deriving Show
 
 data TcState = TcState
@@ -157,14 +163,12 @@ data TcState = TcState
   , subst :: IntMap Inferring
   }
 
-data VarInfo a = VarTerm a | VarType a
-
-type Vars a = Map Id (VarInfo a)
+type VarTypes a = Map Id a
 
 -- | Typechecker monad.
 --
 -- Reader: Map from variable names to their types
-type TcM = RWS (Vars Inferring) (DList Error) TcState
+type TcM = RWS (VarTypes Inferring) (DList Error) TcState
 
 type DList a = Endo [a]
 
@@ -183,25 +187,12 @@ silence = censor $ const emptyDList
 raise :: Error -> TcM ()
 raise = tell . Endo . (:)
 
-getVarType :: VarInfo Inferring -> TcM Inferring
-getVarType = \case
-  VarTerm e -> typeOf e
-  VarType t -> pure t
-
-getVar :: VarInfo a -> Maybe a
-getVar = \case
-  VarTerm e -> Just e
-  VarType _ -> Nothing
-
 lookupVarType :: Id -> TcM Inferring
-lookupVarType i = asks (M.lookup i) >>= traverse getVarType >>= \case
+lookupVarType i = asks (M.lookup i) >>= \case
   Nothing -> do
     raise $ VarOutOfScope i
     UV <$> freshUVar
   Just t -> pure t
-
-lookupVar :: Id -> TcM (Maybe Inferring)
-lookupVar i = (getVar =<<) <$> asks (M.lookup i)
 
 lookupUVar :: UVar -> TcM (Maybe Inferring)
 lookupUVar u = IM.lookup u.id <$> gets (.subst)
@@ -215,7 +206,7 @@ normalizeUVar v = do
     Just (UV v') -> normalizeUVar v' -- TODO maybe zonk in this case
     Just t' -> pure t'
 
-withBinding :: MonadReader (Vars v) m => Id -> VarInfo v -> m a -> m a
+withBinding :: MonadReader (VarTypes v) m => Id -> v -> m a -> m a
 withBinding i t = local (M.insert i t)
 
 class Normalize a where
@@ -253,7 +244,7 @@ instance Normalize Inferring where
     UV v -> normalizeUVar v
 
 raiseUnif :: UnificationFailure -> WriterT (DList UnificationFailure) TcM ()
-raiseUnif = W.tell . Endo . (:)
+raiseUnif = tell . Endo . (:)
 
 class Unify a where
   -- | Intended argument order: Expected, then actual
@@ -262,13 +253,31 @@ class Unify a where
 -- TODO probably reduce here? To avoid trying to reduce on every recursive call of unify'
 -- TODO Q: What happens if e.g. in App we unify left side first, but actually right side contains information we need to successfully unify left side?
 unify :: Inferring -> Inferring -> TcM (Inferring, [UnificationFailure])
-unify e e' = second dListToList <$> W.runWriterT (unify' e e')
+unify e e' = second dListToList <$> runWriterT (unify' e e')
+
+hasUVars :: Inferring -> Bool
+hasUVars = \case
+  Univ _ -> False
+  Expr (e ::: t) -> go e || hasUVars t 
+  UV _ -> True
+  where
+    go = \case
+      Nonsense _ -> False
+      Var _ -> False
+      App x f -> hasUVars x || hasUVars f
+      Pi _ t b -> hasUVars t || hasUVars b
+      Lam _ b -> hasUVars b
+      Bottom -> False
+      Top -> False
+      TT -> False
 
 instance Unify InferringExpr where
   unify' = \cases
-    (Nonsense e) (Nonsense e') -> raiseUnif (Can'tUnifyNonsense e e') *> pure (Nonsense e)
+    (Nonsense e) (Nonsense e') -> raiseUnif (Can'tUnifyNonsense e e') $> Nonsense e
 
-    (Var a) (Var a') -> when (a /= a') (raiseUnif $ Can'tUnifyVars a a') *> pure (Var $ combine a a')
+    (Var a) (Var a') -> if (a /= a')
+      then raiseUnif (Can'tUnifyVars a a') $> Var a
+      else pure (Var $ combine a a')
       where
         -- We prefer to use vars with more information, or else the expected Var
         combine = \cases
@@ -277,8 +286,22 @@ instance Unify InferringExpr where
           _ u'@(Uniq (Unique _ (Just _))) -> u'
           u _ -> u
 
-    -- TODO: for app we might want to only try to unify f and x if one of the f's is fully reduced (no uvars) - keep has uvars flag in uexpr?
-    (App x f) (App x' f') -> App <$> unify' x x' <*> unify' f f' -- XXX Does the order in which we unify x vs f matter? (probably not if ^ TODO is implemented)
+    (App x f) (App y g) -> do
+      ((f', g'), dListToList -> errs) <- listen $ (,) <$> ensureNoUVars f <*> ensureNoUVars g
+      -- We only want to unify if neither f nor g have uvars, since e.g. `Top id` and `TT u1` might be unifiable if u1 is actually a function that gets the type of its arg
+      -- TODO However, this makes us order dependent? Whether it contains a uvar might depend on what else we unify first
+      case NE.nonEmpty errs of
+        Just _ -> pure $ App x f
+        Nothing -> do
+          f'' <- unify' f' g'
+          x' <- unify' x y
+          pure $ App x' f''
+      where
+        ensureNoUVars :: Inferring -> WriterT (DList UnificationFailure) TcM Inferring
+        ensureNoUVars e = do
+          e' <- lift $ zonk e
+          when (hasUVars e) $ raiseUnif $ Can'tUnifyUVarInApp e'
+          pure e'
     (Pi x a b) (Pi x' a' b') -> do
       a'' <- unify' a a'
       u <- lift $ freshUnique Nothing
@@ -394,6 +417,26 @@ instance Rename Inferring where
 rename :: (Rename a, Zonk a) => Id -> Id -> a -> TcM a
 rename orig new = zonk >=> rename' orig new
 
+substVar :: Comonad f => Id -> UExpr f e -> UExpr f e -> UExpr f e
+substVar x a = \case
+  Univ n -> Univ n
+  Expr (extract -> Var x') | x == x' -> a
+  Expr e -> Expr $ substVarExpr <$> e
+  UV u -> UV u
+  Hole -> Hole
+  where
+    substVarExpr = \case
+      Nonsense e -> Nonsense e
+
+      Var v -> Var v
+      App e f -> App (substVar x a e) (substVar x a f)
+      Pi i t b -> Pi i (substVar x a t) (substVar x a b)
+      Lam i b -> Lam i (substVar x a b)
+
+      Bottom -> Bottom
+      Top -> Top
+      TT -> TT
+
 -- TODO: termination checker
 -- | Check takes a type and a parsed expression that is expected to have that type
 check :: Inferring -> Parsed -> TcM Inferring
@@ -414,14 +457,15 @@ check expected expr = case expr of
     App x f -> do
       i <- Uniq <$> freshUnique Nothing
       a <- UV <$> freshUVar
+      b <- UV <$> freshUVar
       k <- UV <$> freshUVar
-      f' <- check (Expr (Pi i a expected ::: k)) f
+      f' <- check (Expr (Pi i a b ::: k)) f
       x' <- check a x
-      -- TODO oh no we actually do need the value of x here in the Reader
-      undefined
+      b' <- tryUnify f expected $ substVar i x' b
+      pure (Expr $ App x' f' ::: b')
     Pi x a b -> do
       a' <- infer a
-      b' <- withBinding x (VarType a') $ infer b
+      b' <- withBinding x a' $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       (ty, errs) <- unify expected (Univ lvl)
       case NE.nonEmpty errs of
@@ -436,7 +480,7 @@ check expected expr = case expr of
       (ty, errs) <- unify expected $ Expr (Pi x a b ::: k)
       case NE.nonEmpty errs of
         Nothing -> do
-          rhs' <- withBinding x (VarType a) $ check b rhs
+          rhs' <- withBinding x a $ check b rhs
           pure $ Expr (Lam x rhs' ::: ty)
         Just es -> do
           raise $ TypeMismatch expr expected (Expr (Pi x a b ::: k)) es
@@ -479,18 +523,18 @@ infer expr = case expr of
       k <- UV <$> freshUVar
       f' <- check (Expr (Pi i a b ::: k)) f
       x' <- check a x
-      pure (Expr $ App x' f' ::: b) -- XXX Oops! We need to bind x for b to be valid
+      pure (Expr $ App x' f' ::: substVar i x' b)
     Pi x a b -> do
       a' <- infer a
-      b' <- withBinding x (VarType a') $ infer b
+      b' <- withBinding x a' $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       pure (Expr $ Pi x a' b' ::: Univ lvl)
     Lam x b -> do
       a <- UV <$> freshUVar
-      b' <- withBinding x (VarType a) $ infer b
+      b' <- withBinding x a $ infer b
       bt <- typeOf b'
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel bt)
-      -- XXX hmm if we have the type 'a in the Pi type anyway, do we really need it in Lam?
+      -- TODO Q: If we later substitute x in bt, does that mean inference has to be able to use x in bt? Maybe not, if we say dependent types can't be inferred
       pure (Expr $ Lam x b' ::: Expr (Pi x a bt ::: Univ lvl))
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)
@@ -506,21 +550,26 @@ typeOf = \case
     raise $ NoTypeForUVar u -- TODO maybe it makes sense if uvars have an optional type, so we don't have to error here (but can return a uvar)?
     infer Hole -- TODO this is probably an issue - because we actually have no way to connect the uvar representing this type with u
 
-class MonadReader (Vars (UExpr (Typed p) p)) (PassMonad p) => Eval p where
+class Monad (PassMonad p) => Eval p where
   type PassMonad p :: Type -> Type
   type UVarResult p :: Type
+  -- NB: Instead of this, we could also just ensure it's zonked before it's evaled
   provideUVar :: UVar' p -> (PassMonad p) (UVarResult p)
   evalTypes :: Bool
   notParsed :: p :~: PParsed -> Void
 
--- | Step through a single pass of the typechecker and return the new expression and whether it was reduced
-step :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> m (e, Bool)
-step = (fmap . second) getAny . runWriterT . step'
+data WasReduced = WasReduced
 
-eval :: (Monad (PassMonad p), Eval p) => (e ~ UExpr (Typed p) p) => e -> PassMonad p e
+instance Semigroup WasReduced where _ <> _ = WasReduced
+
+-- | Step through a single pass of the typechecker and return the new expression and whether it was reduced
+step :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) m e
+step = step'
+
+eval :: (Monad (PassMonad p), Eval p) => (e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) (PassMonad p) e
 eval e = do
-  (e', wasReduced) <- step e
-  if wasReduced then eval e' else pure e'
+  (e', wasReduced) <- listen $ step e
+  if isJust wasReduced then eval e' else pure e'
 
 instance Eval PInferring where
   type PassMonad PInferring = TcM
@@ -530,28 +579,30 @@ instance Eval PInferring where
   notParsed = \case
 
 instance Eval PChecked where
-  type PassMonad PChecked = Reader (Vars Checked)
+  type PassMonad PChecked = Identity
   type UVarResult PChecked = Checked
   provideUVar = \case
   evalTypes = False
   notParsed = \case
 
-{-# SPECIALIZE step' :: Inferring -> WriterT Any TcM Inferring #-}
-{-# SPECIALIZE step' :: Checked -> WriterT Any (Reader (Vars Checked)) Checked #-}
-step' :: (Eval p, MonadReader (Vars e) m, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT Any m e
-step' @p = \case
+{-# SPECIALIZE step' :: Inferring -> WriterT (Maybe WasReduced) TcM Inferring #-}
+{-# SPECIALIZE step' :: Checked -> Writer (Maybe WasReduced) Checked #-}
+step' :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) m e
+step' @p @m = \case
   u@(Univ _) -> pure u
   Expr (e ::: t) -> do
-    vars <- ask
     t' <- if evalTypes @p then step' t else pure t
     let withType x = Expr (x ::: t')
     e' :: UExpr (Typed p) p <- case e of
       Nonsense e' -> pure . withType $ Nonsense e'
 
-      Var a -> maybe (pure . withType $ Var a) (\v -> tellHasReduced *> step' v) $ getVar =<< vars M.!? a
-      -- TODO I think x has to be fully reduced before we do beta reduction. Reason: Otherwise variables in x might be shadowed in places where they're used in f
-      -- TODO alternatively we could make sure that all vars are replaced by uniques before we get here
-      App x f -> undefined -- TODO
+      Var a -> pure . withType $ Var a
+      App x f -> do
+        f' <- eval f
+        -- I think x has to be fully reduced before we do beta reduction. Reason: Otherwise variables in x might be shadowed in places where they're used in f
+        -- alternatively we could make sure that all vars are replaced by uniques before we get here
+        x' <- eval x
+        undefined
       Pi x a b -> do
         a' <- step' a
         b' <- step' b
@@ -565,8 +616,7 @@ step' @p = \case
   UV u -> lift (provideUVar u)
   Hole -> absurd $ notParsed Refl
   where
-    stepWith v e = mapWriterT (local (M.insert v $ VarTerm e)) . step'
-    tellHasReduced = tell (Any True)
+    tellHasReduced = tell @Any @(WriterT _ m) (Any True)
 
 runTcM :: TcM a -> (a, [Error])
 runTcM action = runRWS action M.empty (TcState 0 0 IM.empty) & \case
