@@ -40,7 +40,8 @@ instance Comonad (Typed p) where
   extract (e ::: _) = e
   duplicate (e ::: t) = ((e ::: t) ::: t)
 
-deriving instance Show e => Show (Typed p e)
+instance Show e => Show (Typed p e) where
+  show (e ::: t) = show e ++ " : " ++ show t
 
 type Parsed = UExpr Identity PParsed
 
@@ -90,9 +91,9 @@ tagUnique (Unique n _) name = Unique n (Just name)
 
 instance Show Id where
   show (Name name) = T.unpack name
-  show (Uniq (Unique n name)) = maybe uniq (\n' -> T.unpack n' ++ "_" ++ uniq) name
+  show (Uniq (Unique n name)) = maybe uniq (\n' -> T.unpack n' ++ uniq) name
     where
-      uniq = "q" ++ showNaturalSubscript n
+      uniq = showNaturalSubscript n
 
 data Pass = PParsed | PInferring | PChecked
 
@@ -131,8 +132,8 @@ instance (Show (f (Expr f p))) => Show (Expr f p) where
 
   show (Var i) = show i
   show (App x f) = ("(" ++ show x ++ " " ++ show f ++ ")")
-  show (Pi i t b) = "Π" ++ show i ++ ":" ++ show t ++ "." ++ show b
-  show (Lam i b) = "λ" ++ show i ++ "." ++ show b
+  show (Pi i t b) = "Π " ++ show i ++ " : " ++ show t ++ " . " ++ show b
+  show (Lam i b) = "λ " ++ show i ++ " . " ++ show b
 
   show (Bottom) = "⊥"
   show (Top) = "⊤"
