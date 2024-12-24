@@ -28,7 +28,7 @@ executable placeholder-name
                         MonadComprehensions,
                         TypeAbstractions,
                         ViewPatterns,
-    -- other-modules:
+    other-modules: Parser, TC
     -- other-extensions:
     build-depends:    base ^>=4.20.0.0,
                       text,
@@ -36,5 +36,6 @@ executable placeholder-name
                       containers,
                       transformers,
                       comonad,
+                      megaparsec,
     hs-source-dirs:   app
     default-language: GHC2024
