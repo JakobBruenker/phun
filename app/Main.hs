@@ -5,11 +5,11 @@
 module Main where
 
 import Control.Monad (when, (>=>), join)
-import Control.Monad.Reader (MonadReader (..))
+import Control.Monad.Reader (MonadReader (..), Reader)
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..))
-import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT)
+import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, mapWriterT)
 import Control.Monad.Trans.Writer.CPS qualified as W
 import Data.Bifunctor (second)
 import Data.Char (chr, ord)
@@ -24,7 +24,6 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (isNothing, fromMaybe)
 import Data.Monoid (Endo(..), Any (..))
 import Data.Text (Text)
 import Data.Type.Equality ((:~:) (..))
@@ -158,7 +157,9 @@ data TcState = TcState
   , subst :: IntMap Inferring
   }
 
-type Vars a = Map Id a
+data VarInfo a = VarTerm a | VarType a
+
+type Vars a = Map Id (VarInfo a)
 
 -- | Typechecker monad.
 --
@@ -182,16 +183,25 @@ silence = censor $ const emptyDList
 raise :: Error -> TcM ()
 raise = tell . Endo . (:)
 
+getVarType :: VarInfo Inferring -> TcM Inferring
+getVarType = \case
+  VarTerm e -> typeOf e
+  VarType t -> pure t
+
+getVar :: VarInfo a -> Maybe a
+getVar = \case
+  VarTerm e -> Just e
+  VarType _ -> Nothing
+
 lookupVarType :: Id -> TcM Inferring
-lookupVarType i = do
-  t <- asks (M.lookup i)
-  when (isNothing t) . raise $ VarOutOfScope i
-  case t of
-    Nothing -> do
-      raise $ VarOutOfScope i
-      u <- freshUVar
-      pure (UV u)
-    Just t' -> pure t'
+lookupVarType i = asks (M.lookup i) >>= traverse getVarType >>= \case
+  Nothing -> do
+    raise $ VarOutOfScope i
+    UV <$> freshUVar
+  Just t -> pure t
+
+lookupVar :: Id -> TcM (Maybe Inferring)
+lookupVar i = (getVar =<<) <$> asks (M.lookup i)
 
 lookupUVar :: UVar -> TcM (Maybe Inferring)
 lookupUVar u = IM.lookup u.id <$> gets (.subst)
@@ -205,8 +215,7 @@ normalizeUVar v = do
     Just (UV v') -> normalizeUVar v' -- TODO maybe zonk in this case
     Just t' -> pure t'
 
--- | Add a binding to the context reprsenting the type of a variable
-withBinding :: MonadReader (Vars v) m => Id -> v -> m a -> m a
+withBinding :: MonadReader (Vars v) m => Id -> VarInfo v -> m a -> m a
 withBinding i t = local (M.insert i t)
 
 class Normalize a where
@@ -412,7 +421,7 @@ check expected expr = case expr of
       undefined
     Pi x a b -> do
       a' <- infer a
-      b' <- withBinding x a' $ infer b
+      b' <- withBinding x (VarType a') $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       (ty, errs) <- unify expected (Univ lvl)
       case NE.nonEmpty errs of
@@ -427,7 +436,7 @@ check expected expr = case expr of
       (ty, errs) <- unify expected $ Expr (Pi x a b ::: k)
       case NE.nonEmpty errs of
         Nothing -> do
-          rhs' <- withBinding x a $ check b rhs
+          rhs' <- withBinding x (VarType a) $ check b rhs
           pure $ Expr (Lam x rhs' ::: ty)
         Just es -> do
           raise $ TypeMismatch expr expected (Expr (Pi x a b ::: k)) es
@@ -470,15 +479,15 @@ infer expr = case expr of
       k <- UV <$> freshUVar
       f' <- check (Expr (Pi i a b ::: k)) f
       x' <- check a x
-      pure (Expr $ App x' f' ::: b)
+      pure (Expr $ App x' f' ::: b) -- XXX Oops! We need to bind x for b to be valid
     Pi x a b -> do
       a' <- infer a
-      b' <- withBinding x a' $ infer b
+      b' <- withBinding x (VarType a') $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       pure (Expr $ Pi x a' b' ::: Univ lvl)
     Lam x b -> do
       a <- UV <$> freshUVar
-      b' <- withBinding x a $ infer b
+      b' <- withBinding x (VarType a) $ infer b
       bt <- typeOf b'
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel bt)
       -- XXX hmm if we have the type 'a in the Pi type anyway, do we really need it in Lam?
@@ -495,9 +504,9 @@ typeOf = \case
   Expr (_ ::: t) -> pure t
   UV u -> do
     raise $ NoTypeForUVar u -- TODO maybe it makes sense if uvars have an optional type, so we don't have to error here (but can return a uvar)?
-    infer Hole
+    infer Hole -- TODO this is probably an issue - because we actually have no way to connect the uvar representing this type with u
 
-class Monad (PassMonad p) => Eval p where
+class MonadReader (Vars (UExpr (Typed p) p)) (PassMonad p) => Eval p where
   type PassMonad p :: Type -> Type
   type UVarResult p :: Type
   provideUVar :: UVar' p -> (PassMonad p) (UVarResult p)
@@ -506,7 +515,7 @@ class Monad (PassMonad p) => Eval p where
 
 -- | Step through a single pass of the typechecker and return the new expression and whether it was reduced
 step :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> m (e, Bool)
-step = (fmap . second) getAny . runWriterT . step' M.empty
+step = (fmap . second) getAny . runWriterT . step'
 
 eval :: (Monad (PassMonad p), Eval p) => (e ~ UExpr (Typed p) p) => e -> PassMonad p e
 eval e = do
@@ -521,32 +530,33 @@ instance Eval PInferring where
   notParsed = \case
 
 instance Eval PChecked where
-  type PassMonad PChecked = Identity
+  type PassMonad PChecked = Reader (Vars Checked)
   type UVarResult PChecked = Checked
   provideUVar = \case
   evalTypes = False
   notParsed = \case
 
-{-# SPECIALIZE step' :: Vars Inferring -> Inferring -> WriterT Any TcM Inferring #-}
-{-# SPECIALIZE step' :: Vars Checked -> Checked -> WriterT Any Identity Checked #-}
-step' :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => Vars e -> e -> WriterT Any m e
-step' @p vars = \case
+{-# SPECIALIZE step' :: Inferring -> WriterT Any TcM Inferring #-}
+{-# SPECIALIZE step' :: Checked -> WriterT Any (Reader (Vars Checked)) Checked #-}
+step' :: (Eval p, MonadReader (Vars e) m, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT Any m e
+step' @p = \case
   u@(Univ _) -> pure u
   Expr (e ::: t) -> do
-    t' <- if evalTypes @p then go t else pure t
+    vars <- ask
+    t' <- if evalTypes @p then step' t else pure t
     let withType x = Expr (x ::: t')
     e' :: UExpr (Typed p) p <- case e of
       Nonsense e' -> pure . withType $ Nonsense e'
 
-      Var a -> maybe (pure . withType $ Var a) (\v -> tellHasReduced *> go v) $ vars M.!? a
+      Var a -> maybe (pure . withType $ Var a) (\v -> tellHasReduced *> step' v) $ getVar =<< vars M.!? a
       -- TODO I think x has to be fully reduced before we do beta reduction. Reason: Otherwise variables in x might be shadowed in places where they're used in f
       -- TODO alternatively we could make sure that all vars are replaced by uniques before we get here
       App x f -> undefined -- TODO
       Pi x a b -> do
-        a' <- go a
-        b' <- go b
+        a' <- step' a
+        b' <- step' b
         pure . withType $ Pi x a' b'
-      Lam x b -> withType . Lam x <$> go b
+      Lam x b -> withType . Lam x <$> step' b
 
       Bottom -> pure . withType $ Bottom
       Top -> pure . withType $ Top
@@ -555,8 +565,7 @@ step' @p vars = \case
   UV u -> lift (provideUVar u)
   Hole -> absurd $ notParsed Refl
   where
-    go = step' vars
-    goWith v e = step' (M.insert v e vars) -- TODO could warn about shadowing
+    stepWith v e = mapWriterT (local (M.insert v $ VarTerm e)) . step'
     tellHasReduced = tell (Any True)
 
 runTcM :: TcM a -> (a, [Error])
