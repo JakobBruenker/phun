@@ -50,6 +50,8 @@ instance {-# OVERLAPPING #-} Show (Expr f p) => Show (Identity (Expr f p)) where
 
 type Parsed = UExpr Identity PParsed
 
+type ParsedExpr = Expr Identity PParsed
+
 type Inferring = UExpr (Typed PInferring) PInferring
 
 type InferringExpr = Expr (Typed PInferring) PInferring
@@ -111,7 +113,7 @@ data UExpr f p where
   Hole :: UExpr f PParsed
 
 instance Show (f (Expr f p)) => Show (UExpr f p) where
-  show (Univ n) = "Type" ++ showNaturalSubscript n
+  show (Univ n) = "Type" ++ if n > 0 then showNaturalSubscript n else ""
   show (Expr e) = "(" ++ show e ++ ")"
   show (UV u) = show u
   show Hole = "_"
