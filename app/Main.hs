@@ -23,7 +23,7 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Monoid (Endo(..), Any (..))
+import Data.Monoid (Endo(..))
 import Data.Text (Text)
 import Data.Type.Equality ((:~:) (..))
 import Data.Void (Void, absurd)
@@ -110,6 +110,7 @@ instance Show (f (Expr f p)) => Show (UExpr f p) where
   show (UV u) = show u
   show Hole = "_"
 
+-- TODO we probably need Fix or the ability to define inductive types -- although it seems like maybe a small fixed set of inductive types is enough (dep pair, dep prod, identity)
 type Expr :: (Type -> Type) -> Pass -> Type
 data Expr f p where
   Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
@@ -120,6 +121,7 @@ data Expr f p where
   Lam :: Id -> UExpr f p -> Expr f p
 
   -- Technically, anything below can be encoded with the above
+  -- TODO either remove or add eliminators
   Bottom :: Expr f p
   Top :: Expr f p
   TT :: Expr f p
@@ -306,9 +308,13 @@ instance Unify InferringExpr where
       a'' <- unify' a a'
       u <- lift $ freshUnique Nothing
       let uniq = Uniq u{tag = userName x}
-      -- TODO do we need to add x, x' to the context?
       b'' <- join $ unify' <$> lift (rename x uniq b) <*> lift (rename x' uniq b')
       pure $ Pi uniq a'' b''
+    (Lam x b) (Lam x' b') -> do
+      u <- lift $ freshUnique Nothing
+      let uniq = Uniq u{tag = userName x}
+      b'' <- join $ unify' <$> lift (rename x uniq b) <*> lift (rename x' uniq b')
+      pure $ Lam uniq b''
 
     Bottom Bottom -> pure Bottom
     Top Top -> pure Top
@@ -391,12 +397,8 @@ instance Rename InferringExpr where
 
     Var a -> pure (Var (if a == orig then new else a))
     App x f -> App <$> rename' orig new x <*> rename' orig new f
-    Pi i t b
-      | i == orig -> pure $ Pi i t b
-      | otherwise -> Pi i <$> rename' orig new t <*> rename' orig new b
-    Lam i b
-      | i == orig -> pure $ Lam i b
-      | otherwise -> Lam i <$> rename' orig new b
+    Pi i t b -> Pi i <$> rename' orig new t <*> if i == orig then pure b else rename' orig new b
+    Lam i b -> Lam i <$> if i == orig then pure b else rename' orig new b
 
     Bottom -> pure Bottom
     Top -> pure Top
@@ -430,14 +432,14 @@ substVar x a = \case
 
       Var v -> Var v
       App e f -> App (substVar x a e) (substVar x a f)
-      Pi i t b -> Pi i (substVar x a t) (substVar x a b)
-      Lam i b -> Lam i (substVar x a b)
+      Pi i t b -> Pi i (substVar x a t) if x == i then b else substVar x a b
+      Lam x' b -> Lam x' if x == x' then b else substVar x a b
 
       Bottom -> Bottom
       Top -> Top
       TT -> TT
 
--- TODO: termination checker
+-- TODO: termination checker -- actually this is not necessary if we support inductive types
 -- | Check takes a type and a parsed expression that is expected to have that type
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
@@ -588,7 +590,7 @@ instance Eval PChecked where
 {-# SPECIALIZE step' :: Inferring -> WriterT (Maybe WasReduced) TcM Inferring #-}
 {-# SPECIALIZE step' :: Checked -> Writer (Maybe WasReduced) Checked #-}
 step' :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) m e
-step' @p @m = \case
+step' @p = \case
   u@(Univ _) -> pure u
   Expr (e ::: t) -> do
     t' <- if evalTypes @p then step' t else pure t
@@ -599,10 +601,12 @@ step' @p @m = \case
       Var a -> pure . withType $ Var a
       App x f -> do
         f' <- eval f
-        -- I think x has to be fully reduced before we do beta reduction. Reason: Otherwise variables in x might be shadowed in places where they're used in f
-        -- alternatively we could make sure that all vars are replaced by uniques before we get here
         x' <- eval x
-        undefined
+        case f' of
+          Expr (extract -> Lam i rhs) -> do
+            tellHasReduced
+            step $ substVar i x' rhs
+          _ -> pure . withType $ App x' f'
       Pi x a b -> do
         a' <- step' a
         b' <- step' b
@@ -616,7 +620,7 @@ step' @p @m = \case
   UV u -> lift (provideUVar u)
   Hole -> absurd $ notParsed Refl
   where
-    tellHasReduced = tell @Any @(WriterT _ m) (Any True)
+    tellHasReduced = tell (Just WasReduced)
 
 runTcM :: TcM a -> (a, [Error])
 runTcM action = runRWS action M.empty (TcState 0 0 IM.empty) & \case
