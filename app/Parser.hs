@@ -4,21 +4,27 @@ import Text.Megaparsec
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Void
-import TC (Parsed, UExpr (..), ParsedExpr, Expr (..), Id (..))
+import TC (Parsed, UExpr (..), ParsedExpr, Expr (..), Id (..), Decl (..), Module (..))
 import Numeric.Natural (Natural)
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
 import Data.Char (chr, ord)
-import Data.Functor (($>), (<&>))
+import Data.Functor (($>), void)
 import Control.Comonad.Identity (Identity(..))
 
 type Parser = Parsec Void Text
 
-sc :: Parser ()
-sc = L.space
-  space1
+skipSpace :: Parser () -> Parser ()
+skipSpace sp = L.space
+  sp
   (L.skipLineComment "--")
-  (L.skipBlockComment "{-" "-}")
+  (L.skipBlockCommentNested "{-" "-}")
+
+sc :: Parser ()
+sc = skipSpace (hspace1 *> void (optional . try $ newline *> hspace1))
+
+hsc :: Parser ()
+hsc = skipSpace hspace1
 
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme sc
@@ -97,11 +103,7 @@ pExprNoApp = choice
   ]
 
 pApp :: Parser ParsedExpr
-pApp = do
-  (fun, lastArg, rest) <- some pUExprNoApp <&> reverse >>= \case
-    (f:x0:rest) -> pure (f, x0, rest)
-    _ -> fail "impossible: expected at least one argument"
-  pure $ foldr (\x y -> App x (Expr (Identity y))) (App lastArg fun) $ reverse rest 
+pApp = App <$> pUExprNoApp <*> pUExpr
 
 pPi :: Parser ParsedExpr
 pPi = do
@@ -123,3 +125,22 @@ pLam = do
 
 pVar :: Parser ParsedExpr
 pVar = Var . Name <$> identifier
+
+pDecl :: Parser Decl
+pDecl = do
+  x <- identifier
+  _ <- symbol ":"
+  ty <- pUExpr
+  _ <- newline
+  term <- pUExpr
+  pure $ Decl (Name x) ty term
+
+pModule :: Parser Module
+pModule = do
+  _ <- sc
+  decls <- many pDecl
+  expr <- optional $ symbol "in" *> pUExpr
+  pure $ Module decls expr
+
+parseModule :: String -> Text -> Either (ParseErrorBundle Text Void) Module
+parseModule = parse pModule

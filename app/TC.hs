@@ -8,7 +8,7 @@ import Control.Monad (when, (>=>), join)
 import Control.Monad.Reader (MonadReader (..))
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Maybe (MaybeT(..))
+import Control.Monad.Trans.Maybe (MaybeT(..), hoistMaybe)
 import Control.Monad.Trans.Writer.CPS (WriterT, Writer, listen, runWriterT)
 import Data.Bifunctor (second)
 import Data.Char (chr, ord)
@@ -32,7 +32,16 @@ import qualified Data.Text as T
 import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
 
--- TODO why do we get unification errors for infer id, but not for infer App id id?
+data Module = Module 
+  { decls :: [Decl]
+  , mainExpr :: Maybe Parsed
+  } deriving Show
+
+data Decl = Decl
+  { defName :: Id
+  , defType :: Parsed
+  , defTerm :: Parsed
+  } deriving Show
 
 -- | LHS: Expr, RHS: Type
 type Typed :: Pass -> Type -> Type
@@ -155,6 +164,8 @@ data Error
   | VarOutOfScope Id
   | NoTypeForUVar UVar
   | NoLevelForUVar UVar
+  | HasNonsense Parsed
+  | StillHasUnifs UVar
   deriving Show
 
 -- TODO add details
@@ -338,6 +349,9 @@ instance Unify u => Unify (Typed PInferring u) where
 
 instance Unify Inferring where
 -- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
+-- TODO once we have the Id type, we probably need given constraints, since in the eliminator, equalities can hold only locally (e.g. 1 = 2)
+     -- possibly what you want to do is, in the last unification case, the failure one, go through each equality you have, zonk it, and check if it matches (possibly accounting for sym, probably not trans)
+     -- Although is that really necessary? If we can choose not to account for trans, can we just choose to have the player transport everything manually? I think yes
 -- TODO I think TcM actually needs to keep track of both Var terms and Var types (for Pi and Lam binders), since if we're evalling deep in a term we need to be able to access bindings from further out
     --  Wait that might not be true, because we only introduce new terms when evalling App, and then at the end of eval all vars should be replaced I think
   unify' = \cases
@@ -446,6 +460,42 @@ substVar x a = \case
       Bottom -> Bottom
       Top -> Top
       TT -> TT
+
+toChecked :: Inferring -> MaybeT TcM Checked
+toChecked = \case
+  Univ n -> pure $ Univ n
+  Expr (e ::: t) -> do
+    t' <- toChecked t
+    e' <- case e of
+      Nonsense p -> do
+        lift . raise $ HasNonsense p
+        hoistMaybe Nothing
+      Var a -> pure $ Var a
+      App x f -> App <$> toChecked x <*> toChecked f
+      Pi x a b -> Pi x <$> toChecked a <*> toChecked b
+      Lam x b -> Lam x <$> toChecked b
+
+      Bottom -> pure Bottom
+      Top -> pure Top
+      TT -> pure TT
+    pure $ Expr (e' ::: t')
+  UV u -> do
+    lift . raise $ StillHasUnifs u
+    hoistMaybe Nothing
+
+-- XXX need to pass the previous decls to the next decls
+checkModule :: Module -> TcM (Maybe Checked)
+checkModule (Module decls mainExpr) = do
+  traverse_ checkDecl decls
+  traverse infer mainExpr >>= \case
+    Nothing -> pure Nothing
+    Just e -> runMaybeT $ toChecked e
+  where
+    checkDecl :: Decl -> TcM (Id, Inferring)
+    checkDecl (Decl name ty term) = do
+      ty' <- infer ty
+      term' <- check ty' term
+      withBinding name ty' $ pure (name, term')
 
 -- TODO: termination checker -- actually this is not necessary if we support inductive types
 -- | Check takes a type and a parsed expression that is expected to have that type
@@ -595,6 +645,7 @@ instance Eval PChecked where
   evalTypes = False
   notParsed = \case
 
+-- TODO resolve variables
 {-# SPECIALIZE step' :: Inferring -> WriterT (Maybe WasReduced) TcM Inferring #-}
 {-# SPECIALIZE step' :: Checked -> Writer (Maybe WasReduced) Checked #-}
 step' :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) m e
