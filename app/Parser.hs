@@ -1,71 +1,30 @@
 module Parser where
 
-import Text.Megaparsec
+import Text.Megaparsec hiding (Token)
 import Data.Text (Text)
-import Data.Text qualified as T
 import Data.Void
 import TC (Parsed, UExpr (..), ParsedExpr, Expr (..), Id (..), Decl (..), Module (..))
-import Numeric.Natural (Natural)
-import Text.Megaparsec.Char
-import qualified Text.Megaparsec.Char.Lexer as L
-import Data.Char (chr, ord)
-import Data.Functor (($>), void)
 import Control.Comonad.Identity (Identity(..))
+import Lexer
+import qualified Data.Set as Set
+import Data.Foldable (find)
 
-type Parser = Parsec Void Text
+type Parser = Parsec Void [Token]
 
-skipSpace :: Parser () -> Parser ()
-skipSpace sp = L.space
-  sp
-  (L.skipLineComment "--")
-  (L.skipBlockCommentNested "{-" "-}")
+parseTokenMatching :: (Token -> Bool) -> Parser Token
+parseTokenMatching p = token (find p . Just) Set.empty
 
-sc :: Parser ()
-sc = skipSpace (hspace1 *> void (optional . try $ newline *> hspace1))
-
-hsc :: Parser ()
-hsc = skipSpace hspace1
-
-lexeme :: Parser a -> Parser a
-lexeme = L.lexeme sc
-
-symbol :: Text -> Parser Text
-symbol = L.symbol sc
+parseToken :: Token -> Parser Token
+parseToken = parseTokenMatching . (==)
 
 parens :: Parser a -> Parser a
-parens = between (symbol "(") (symbol ")")
-
-identifier :: Parser Text
-identifier = lexeme $ try $ do
-  first <- letterChar <|> char '_'
-  rest <- many (alphaNumChar <|> char '_' <|> char '\'')
-  let ident = T.pack (first:rest)
-  if ident `elem` reserved 
-    then fail $ "keyword " <> show ident <> " cannot be used as identifier"
-    else pure ident
-
-reserved :: [Text] 
-reserved = ["Pi", "∏", "Π", "λ"]
-
-pNatural :: Parser Natural
-pNatural = lexeme L.decimal
-
-subscriptDigitChar :: Parser Char
-subscriptDigitChar = oneOf ['₀'..'₉']
-
-pSubscriptNatural :: Parser Natural
-pSubscriptNatural = lexeme $ do
-  n <- some subscriptDigitChar
-  pure (read $ map subscriptToDigit n)
-  where 
-    subscriptToDigit c = chr (ord c - ord '₀' + ord '0')
+parens = between (parseToken TLParen) (parseToken TRParen)
 
 pUExpr :: Parser Parsed
 pUExpr = choice
   [ Expr . Identity <$> pExpr
   , pOtherUExpr
   ]
-
 
 pUExprNoApp :: Parser Parsed
 pUExprNoApp = choice
@@ -76,18 +35,14 @@ pUExprNoApp = choice
 pOtherUExpr :: Parser Parsed
 pOtherUExpr = choice
   [ pUniv
-  , pHole
+  , Hole <$ parseToken THole
   , parens pUExpr
   ]
 
 pUniv :: Parser Parsed
 pUniv = do
-  _ <- symbol "Type"
-  n <- option 0 (pNatural <|> pSubscriptNatural)
+  TType n <- parseTokenMatching \case TType _ -> True; _ -> False
   pure (Univ n)
-
-pHole :: Parser Parsed
-pHole = lexeme (char '_') $> Hole
 
 pExpr :: Parser ParsedExpr
 pExpr = choice
@@ -102,24 +57,31 @@ pExprNoApp = choice
   , pVar
   ]
 
+identifier :: Parser Text
+identifier = do
+  TIdent name <- parseTokenMatching \case
+    TIdent _ -> True
+    _ -> False
+  pure name
+
 pApp :: Parser ParsedExpr
 pApp = App <$> pUExprNoApp <*> pUExpr
 
 pPi :: Parser ParsedExpr
 pPi = do
-  _ <- symbol "Pi" <|> symbol "Π" <|> symbol "∏"
+  _ <- parseToken TPi
   x <- identifier
-  _ <- symbol ":"
+  _ <- parseToken TColon
   a <- pUExpr
-  _ <- symbol "."
+  _ <- parseToken TDot
   b <- pUExpr
   pure $ Pi (Name x) a b
 
 pLam :: Parser ParsedExpr
 pLam = do
-  _ <- symbol "λ" <|> symbol "\\"
+  _ <- parseToken TLambda
   x <- identifier
-  _ <- symbol "."
+  _ <- parseToken TDot
   rhs <- pUExpr
   pure $ Lam (Name x) rhs
 
@@ -128,19 +90,21 @@ pVar = Var . Name <$> identifier
 
 pDecl :: Parser Decl
 pDecl = do
+  _ <- parseToken SOL
   x <- identifier
-  _ <- symbol ":"
+  _ <- parseToken TColon
   ty <- pUExpr
-  _ <- newline
+  _ <- parseToken SOL
   term <- pUExpr
   pure $ Decl (Name x) ty term
 
 pModule :: Parser Module
 pModule = do
-  _ <- sc
-  decls <- many pDecl
-  expr <- optional $ symbol "in" *> pUExpr
-  pure $ Module decls expr
+  decls <- many $ try pDecl
+  _ <- parseToken SOL
+  expr <- pUExpr
+  eof
+  pure $ Module decls $ Just expr
 
-parseModule :: String -> Text -> Either (ParseErrorBundle Text Void) Module
+parseModule :: String -> [Token] -> Either (ParseErrorBundle [Token] Void) Module
 parseModule = parse pModule

@@ -1,5 +1,6 @@
 module Main where
 
+import Lexer
 import Parser
 import TC
 import System.Environment (getArgs)
@@ -8,6 +9,7 @@ import Text.Megaparsec.Error (errorBundlePretty)
 import qualified Data.List.NonEmpty as NE
 import Data.Foldable (for_)
 import Control.Monad.Trans.Writer.CPS (runWriter)
+import System.IO (hPrint, stderr, hPutStrLn)
 
 main :: IO ()
 main = do
@@ -17,10 +19,16 @@ main = do
   input <- case filename of
     "-" -> T.getContents
     _ -> T.readFile filename
-  md <- case parseModule filename input of
-    Left err -> error $ errorBundlePretty err
-    Right md -> pure md
-  case runTcM $ checkModule md of
-    (_, NE.nonEmpty -> Just errs) -> for_ errs print
-    (Just expr, _) -> print . fst . runWriter $ eval expr
-    _ -> putStrLn "ok"
+  case parseModule filename (lexFile input) of
+    Left err -> hPutStrLn stderr $ errorBundlePretty err
+    Right md -> do
+      -- debugging
+      T.putStrLn input
+      print md
+      case runTcM $ checkModule md of
+        (_, NE.nonEmpty -> Just errs) -> for_ errs (hPrint stderr)
+        (Just expr, _) -> print . fst . runWriter $ eval expr
+        _foo -> do
+          -- debugging
+          print _foo
+          putStrLn "ok"

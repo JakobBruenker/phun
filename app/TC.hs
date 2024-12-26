@@ -125,7 +125,7 @@ instance Show (f (Expr f p)) => Show (UExpr f p) where
   show (Univ n) = "Type" ++ if n > 0 then showNaturalSubscript n else ""
   show (Expr e) = "(" ++ show e ++ ")"
   show (UV u) = show u
-  show Hole = "_"
+  show Hole = "?"
 
 -- TODO we probably need Fix or the ability to define inductive types -- although it seems like maybe a small fixed set of inductive types is enough (dep pair, dep prod, identity)
 type Expr :: (Type -> Type) -> Pass -> Type
