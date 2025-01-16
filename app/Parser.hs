@@ -3,7 +3,7 @@ module Parser where
 import Text.Megaparsec hiding (Token)
 import Data.Text (Text)
 import Data.Void
-import TC (Parsed, UExpr (..), ParsedExpr, Expr (..), Id (..), Decl (..), Module (..))
+import TC (Parsed, UExpr (..), ParsedExpr, Pass(..), Expr (..), Id (..), Decl (..), Module (..))
 import Control.Comonad.Identity (Identity(..))
 import Lexer
 import qualified Data.Set as Set
@@ -88,7 +88,7 @@ pLam = do
 pVar :: Parser ParsedExpr
 pVar = Var . Name <$> identifier
 
-pDecl :: Parser Decl
+pDecl :: Parser (Decl PParsed)
 pDecl = do
   _ <- parseToken SOL
   x <- identifier
@@ -98,7 +98,7 @@ pDecl = do
   term <- pUExpr
   pure $ Decl (Name x) ty term
 
-pModule :: Parser Module
+pModule :: Parser (Module PParsed)
 pModule = do
   decls <- many $ try pDecl
   _ <- parseToken SOL
@@ -106,5 +106,5 @@ pModule = do
   eof
   pure $ Module decls $ Just expr
 
-parseModule :: String -> [Token] -> Either (ParseErrorBundle [Token] Void) Module
+parseModule :: String -> [Token] -> Either (ParseErrorBundle [Token] Void) (Module PParsed)
 parseModule = parse pModule

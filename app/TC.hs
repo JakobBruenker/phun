@@ -32,16 +32,28 @@ import qualified Data.Text as T
 import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
 
-data Module = Module 
-  { decls :: [Decl]
-  , mainExpr :: Maybe Parsed
-  } deriving Show
+type Module :: Pass -> Type
+data Module p = Module 
+  { decls :: [Decl p]
+  , mainExpr :: Maybe (PassUExpr p)
+  }
 
-data Decl = Decl
+deriving instance (Show (DeclType p), Show (PassUExpr p)) => Show (Module p)
+
+type Decl :: Pass -> Type
+data Decl p = Decl
   { defName :: Id
-  , defType :: Parsed
-  , defTerm :: Parsed
-  } deriving Show
+  , defType :: DeclType p
+  , defTerm :: PassUExpr p
+  }
+
+deriving instance (Show (DeclType p), Show (PassUExpr p)) => Show (Decl p)
+
+-- We only need to keep track of the type in Parsed, since otherwise it's included in the term
+type DeclType :: Pass -> Type
+type family DeclType p where
+  DeclType PParsed = Parsed
+  DeclType _ = ()
 
 -- | LHS: Expr, RHS: Type
 type Typed :: Pass -> Type -> Type
@@ -66,6 +78,12 @@ type Inferring = UExpr (Typed PInferring) PInferring
 type InferringExpr = Expr (Typed PInferring) PInferring
 
 type Checked = UExpr (Typed PChecked) PChecked
+
+type PassUExpr :: Pass -> Type
+type family PassUExpr p where
+  PassUExpr PParsed = Parsed
+  PassUExpr PInferring = Inferring
+  PassUExpr PChecked = Checked
 
 -- | Unification Variables
 type UVar' :: Pass -> Type
@@ -155,6 +173,7 @@ instance (Show (f (Expr f p))) => Show (Expr f p) where
   show (Top) = "⊤"
   show (TT) = "tt"
 
+-- TODO pretty print
 data Error
   -- TODO add source location
   = TypeMismatch Parsed Inferring Inferring (NonEmpty UnificationFailure)
@@ -483,19 +502,30 @@ toChecked = \case
     lift . raise $ StillHasUnifs u
     hoistMaybe Nothing
 
--- XXX need to pass the previous decls to the next decls
-checkModule :: Module -> TcM (Maybe Checked)
-checkModule (Module decls mainExpr) = do
-  traverse_ checkDecl decls
-  traverse infer mainExpr >>= \case
-    Nothing -> pure Nothing
-    Just e -> runMaybeT $ toChecked e
+inferModule :: Module PParsed -> TcM (Module PInferring)
+inferModule (Module declarations mainExpr) = case declarations of
+  [] -> Module [] <$> traverse infer mainExpr
+  decl:decls -> do
+    decl'@(Decl name () term) <- inferDecl decl
+    ty <- typeOf term
+    (Module decls' mainExpr') <- withBinding name ty (inferModule (Module decls mainExpr))
+    pure $ Module (decl':decls') mainExpr'
+    where
+      inferDecl :: Decl PParsed -> TcM (Decl PInferring)
+      inferDecl (Decl name ty term) = do
+        ty' <- infer ty
+        term' <- check ty' term
+        pure $ Decl name () term'
+
+checkModule :: Module PParsed -> TcM (Maybe (Module PChecked))
+checkModule mod' = do
+  Module decls mainExpr <- inferModule mod'
+  runMaybeT $ Module
+    <$> traverse checkDecl decls
+    <*> traverse toChecked mainExpr
   where
-    checkDecl :: Decl -> TcM (Id, Inferring)
-    checkDecl (Decl name ty term) = do
-      ty' <- infer ty
-      term' <- check ty' term
-      withBinding name ty' $ pure (name, term')
+    checkDecl :: Decl PInferring -> MaybeT TcM (Decl PChecked)
+    checkDecl (Decl name () term) = Decl name () <$> toChecked term
 
 -- TODO: termination checker -- actually this is not necessary if we support inductive types
 -- | Check takes a type and a parsed expression that is expected to have that type
