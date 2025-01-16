@@ -31,6 +31,7 @@ import GHC.Natural (Natural)
 import qualified Data.Text as T
 import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
+import GHC.Records (HasField (..))
 
 type Module :: Pass -> Type
 data Module p = Module 
@@ -152,8 +153,8 @@ data Expr f p where
 
   Var :: Id -> Expr f p
   App :: UExpr f p -> UExpr f p -> Expr f p
-  Pi :: Id -> UExpr f p -> UExpr f p -> Expr f p
-  Lam :: Id -> UExpr f p -> Expr f p
+  Pi :: IdOrWildcard p -> UExpr f p -> UExpr f p -> Expr f p
+  Lam :: IdOrWildcard p -> UExpr f p -> Expr f p
   -- TODO dependent sum
 
   -- Technically, anything below can be encoded with the above
@@ -162,17 +163,33 @@ data Expr f p where
   Top :: Expr f p
   TT :: Expr f p
 
-instance (Show (f (Expr f p))) => Show (Expr f p) where
-  show (Nonsense e) = show e
+type IdOrWildcard :: Pass -> Type
+data IdOrWildcard p where
+  Id :: Id -> IdOrWildcard p
+  Wildcard :: IdOrWildcard PParsed
 
-  show (Var i) = show i
-  show (App f x) = ("(" ++ show f ++ " " ++ show x ++ ")")
-  show (Pi i t b) = "Π " ++ show i ++ " : " ++ show t ++ " . " ++ show b
-  show (Lam i b) = "λ " ++ show i ++ " . " ++ show b
+instance Show (IdOrWildcard p) where
+  show = \case
+    Id i -> show i
+    Wildcard -> "_"
 
-  show (Bottom) = "⊥"
-  show (Top) = "⊤"
-  show (TT) = "tt"
+instance NotParsed p => HasField "id" (IdOrWildcard p) Id where
+  getField = \case
+    Id i -> i
+    Wildcard -> absurd $ notParsed Refl
+
+instance Show (f (Expr f p)) => Show (Expr f p) where
+  show = \case
+    Nonsense e -> show e
+
+    Var i -> show i
+    App f x -> ("(" ++ show f ++ " " ++ show x ++ ")")
+    Pi i t b -> "Π " ++ show i ++ " : " ++ show t ++ " . " ++ show b
+    Lam i b -> "λ " ++ show i ++ " . " ++ show b
+
+    Bottom -> "⊥"
+    Top -> "⊤"
+    TT -> "tt"
 
 -- TODO pretty print
 data Error
@@ -346,14 +363,14 @@ instance Unify InferringExpr where
     (Pi x a b) (Pi x' a' b') -> do
       a'' <- unify' a a'
       u <- lift $ freshUnique Nothing
-      let uniq = Uniq u{tag = userName x}
-      b'' <- join $ unify' <$> lift (rename x uniq b) <*> lift (rename x' uniq b')
-      pure $ Pi uniq a'' b''
+      let uniq = Uniq u{tag = userName x.id}
+      b'' <- join $ unify' <$> lift (rename x.id uniq b) <*> lift (rename x'.id uniq b')
+      pure $ Pi (Id uniq) a'' b''
     (Lam x b) (Lam x' b') -> do
       u <- lift $ freshUnique Nothing
-      let uniq = Uniq u{tag = userName x}
-      b'' <- join $ unify' <$> lift (rename x uniq b) <*> lift (rename x' uniq b')
-      pure $ Lam uniq b''
+      let uniq = Uniq u{tag = userName x.id}
+      b'' <- join $ unify' <$> lift (rename x.id uniq b) <*> lift (rename x'.id uniq b')
+      pure $ Lam (Id uniq) b''
 
     Bottom Bottom -> pure Bottom
     Top Top -> pure Top
@@ -439,8 +456,8 @@ instance Rename InferringExpr where
 
     Var a -> pure (Var (if a == orig then new else a))
     App f x -> App <$> rename' orig new f <*> rename' orig new x
-    Pi i t b -> Pi i <$> rename' orig new t <*> if i == orig then pure b else rename' orig new b
-    Lam i b -> Lam i <$> if i == orig then pure b else rename' orig new b
+    Pi i t b -> Pi i <$> rename' orig new t <*> if i.id == orig then pure b else rename' orig new b
+    Lam i b -> Lam i <$> if i.id == orig then pure b else rename' orig new b
 
     Bottom -> pure Bottom
     Top -> pure Top
@@ -461,7 +478,7 @@ instance Rename Inferring where
 rename :: (Rename a, Zonk a) => Id -> Id -> a -> TcM a
 rename orig new = zonk >=> rename' orig new
 
-substVar :: Comonad f => Id -> UExpr f e -> UExpr f e -> UExpr f e
+substVar :: (NotParsed p, Comonad f) => Id -> UExpr f p -> UExpr f p -> UExpr f p
 substVar x a = \case
   Univ n -> Univ n
   Expr (extract -> Var x') | x == x' -> a
@@ -474,8 +491,8 @@ substVar x a = \case
 
       Var v -> Var v
       App f e -> App (substVar x a f) (substVar x a e)
-      Pi i t b -> Pi i (substVar x a t) if x == i then b else substVar x a b
-      Lam x' b -> Lam x' if x == x' then b else substVar x a b
+      Pi i t b -> Pi i (substVar x a t) if x == i.id then b else substVar x a b
+      Lam x' b -> Lam x' if x == x'.id then b else substVar x a b
 
       Bottom -> Bottom
       Top -> Top
@@ -492,8 +509,8 @@ toChecked = \case
         hoistMaybe Nothing
       Var a -> pure $ Var a
       App f x -> App <$> toChecked f <*> toChecked x
-      Pi x a b -> Pi x <$> toChecked a <*> toChecked b
-      Lam x b -> Lam x <$> toChecked b
+      Pi (Id x) a b -> Pi (Id x) <$> toChecked a <*> toChecked b
+      Lam (Id x) b -> Lam (Id x) <$> toChecked b
 
       Bottom -> pure Bottom
       Top -> pure Top
@@ -550,31 +567,37 @@ check expected expr = case expr of
       a <- UV <$> freshUVar
       b <- UV <$> freshUVar
       k <- UV <$> freshUVar
-      f' <- check (Expr (Pi i a b ::: k)) f
+      f' <- check (Expr (Pi (Id i) a b ::: k)) f
       x' <- check a x
       b' <- tryUnify f expected $ substVar i x' b
       pure (Expr $ App f' x' ::: b')
-    Pi x a b -> do
+    Pi x' a b -> do
+      x <- case x' of
+        Id i -> pure i
+        Wildcard -> Uniq <$> freshUnique Nothing
       a' <- infer a
       b' <- withBinding x a' $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       (ty, errs) <- unify expected (Univ lvl)
       case NE.nonEmpty errs of
-        Nothing -> pure $ Expr (Pi x a' b' ::: ty)
+        Nothing -> pure $ Expr (Pi (Id x) a' b' ::: ty)
         Just es -> do
           raise $ TypeMismatch expr expected (Univ lvl) es
           pure $ Expr (Nonsense expr ::: ty)
-    Lam x rhs -> do
+    Lam x' rhs -> do
+      x <- case x' of
+        Id i -> pure i
+        Wildcard -> Uniq <$> freshUnique Nothing
       a <- UV <$> freshUVar
       b <- UV <$> freshUVar
       k <- UV <$> freshUVar
-      (ty, errs) <- unify expected $ Expr (Pi x a b ::: k)
+      (ty, errs) <- unify expected $ Expr (Pi (Id x) a b ::: k)
       case NE.nonEmpty errs of
         Nothing -> do
           rhs' <- withBinding x a $ check b rhs
-          pure $ Expr (Lam x rhs' ::: ty)
+          pure $ Expr (Lam (Id x) rhs' ::: ty)
         Just es -> do
-          raise $ TypeMismatch expr expected (Expr (Pi x a b ::: k)) es
+          raise $ TypeMismatch expr expected (Expr (Pi (Id x) a b ::: k)) es
           pure $ Expr (Nonsense expr ::: ty)
 
     Bottom -> Expr . (Bottom :::) <$> tryUnify expr expected (Univ 0)
@@ -612,21 +635,27 @@ infer expr = case expr of
       b <- UV <$> freshUVar
       i <- Uniq <$> freshUnique Nothing
       k <- UV <$> freshUVar
-      f' <- check (Expr (Pi i a b ::: k)) f
+      f' <- check (Expr (Pi (Id i) a b ::: k)) f
       x' <- check a x
       pure (Expr $ App f' x' ::: substVar i x' b)
-    Pi x a b -> do
+    Pi x' a b -> do
+      x <- case x' of
+        Id i -> pure i
+        Wildcard -> Uniq <$> freshUnique Nothing
       a' <- infer a
       b' <- withBinding x a' $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
-      pure (Expr $ Pi x a' b' ::: Univ lvl)
-    Lam x b -> do
+      pure (Expr $ Pi (Id x) a' b' ::: Univ lvl)
+    Lam x' b -> do
+      x <- case x' of
+        Id i -> pure i
+        Wildcard -> Uniq <$> freshUnique Nothing
       a <- UV <$> freshUVar
       b' <- withBinding x a $ infer b
       bt <- typeOf b'
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel bt)
       -- TODO Q: If we later substitute x in bt, does that mean inference has to be able to use x in bt? Maybe not, if we say dependent types can't be inferred
-      pure (Expr $ Lam x b' ::: Expr (Pi x a bt ::: Univ lvl))
+      pure (Expr $ Lam (Id x) b' ::: Expr (Pi (Id x) a bt ::: Univ lvl))
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)
     Top -> pure (Expr $ Top ::: Univ 0)
@@ -641,13 +670,16 @@ typeOf = \case
     raise $ NoTypeForUVar u -- TODO maybe it makes sense if uvars have an optional type, so we don't have to error here (but can return a uvar)?
     infer Hole -- TODO this is probably an issue - because we actually have no way to connect the uvar representing this type with u
 
-class Monad (PassMonad p) => Eval p where
+class (NotParsed p, Monad (PassMonad p)) => Eval p where
   type PassMonad p :: Type -> Type
   type UVarResult p :: Type
   -- NB: Instead of this, we could also just ensure it's zonked before it's evaled
   provideUVar :: UVar' p -> (PassMonad p) (UVarResult p)
   evalTypes :: Bool
-  notParsed :: p :~: PParsed -> Void
+
+class NotParsed p where notParsed :: p :~: PParsed -> Void
+instance NotParsed PInferring where notParsed = \case
+instance NotParsed PChecked where notParsed = \case
 
 data WasReduced = WasReduced deriving Show
 
@@ -667,14 +699,12 @@ instance Eval PInferring where
   type UVarResult PInferring = Inferring
   provideUVar = normalizeUVar
   evalTypes = True
-  notParsed = \case
 
 instance Eval PChecked where
   type PassMonad PChecked = Identity
   type UVarResult PChecked = Checked
   provideUVar = \case
   evalTypes = False
-  notParsed = \case
 
 -- TODO resolve variables
 {-# SPECIALIZE step' :: Inferring -> WriterT (Maybe WasReduced) TcM Inferring #-}
@@ -695,7 +725,7 @@ step' @p = \case
         case f' of
           Expr (extract -> Lam i rhs) -> do
             tellHasReduced
-            step $ substVar i x' rhs
+            step $ substVar i.id x' rhs
           _ -> pure . withType $ App f' x'
       Pi x a b -> do
         a' <- step' a

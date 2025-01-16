@@ -3,7 +3,7 @@ module Parser where
 import Text.Megaparsec hiding (Token)
 import Data.Text (Text)
 import Data.Void
-import TC (Parsed, UExpr (..), ParsedExpr, Pass(..), Expr (..), Id (..), Decl (..), Module (..))
+import TC (Parsed, UExpr (..), ParsedExpr, Pass(..), Expr (..), Id (..), Decl (..), Module (..), IdOrWildcard (..))
 import Control.Comonad.Identity (Identity(..))
 import Lexer
 import Data.Set qualified as Set
@@ -65,10 +65,10 @@ data Identifier = IUniv Natural | IHole | IVar Text
 
 identifier :: Parser Identifier
 identifier = do
-  TIdent name <- parseTokenMatching \case
+  TIdent i <- parseTokenMatching \case
     TIdent _ -> True
     _ -> False
-  pure $ disambiguateIdentifier name
+  pure $ disambiguateIdentifier i
   where
     disambiguateIdentifier :: Text -> Identifier
     disambiguateIdentifier = \case
@@ -82,12 +82,16 @@ identifier = do
       t -> IVar t
     subscriptToDigit c = chr (ord c - ord '₀' + ord '0')
 
-pat :: Parser Text
+pat :: Parser (Maybe Text)
 pat = identifier >>= \case
-  IVar t -> pure t
-  -- IHole -> pure Nothing -- A hole is treated as wildcard in pattern context -- TODO
-  IHole -> error "not implemented"
+  IVar t -> pure (Just t)
+  IHole -> pure Nothing -- A hole is treated as wildcard in pattern context
   IUniv _ -> fail $ "Expected variable name or wildcard, got a universe"
+
+name :: Parser Text
+name = identifier >>= \case
+  IVar t -> pure t
+  _ -> fail "Expected variable name"
 
 pApp :: Parser ParsedExpr
 pApp = App <$> pUExprNoApp <*> pUExpr
@@ -100,7 +104,7 @@ pPi = do
   a <- pUExpr
   _ <- parseToken TDot
   b <- pUExpr
-  pure $ Pi (Name x) a b
+  pure $ Pi (maybe Wildcard (Id . Name) x) a b
 
 pLam :: Parser ParsedExpr
 pLam = do
@@ -108,12 +112,12 @@ pLam = do
   x <- pat
   _ <- parseToken TDot
   rhs <- pUExpr
-  pure $ Lam (Name x) rhs
+  pure $ Lam (maybe Wildcard (Id . Name) x) rhs
 
 pDecl :: Parser (Decl PParsed)
 pDecl = do
   _ <- parseToken SOL
-  x <- pat
+  x <- name
   _ <- parseToken TColon
   ty <- pUExpr
   _ <- parseToken SOL
