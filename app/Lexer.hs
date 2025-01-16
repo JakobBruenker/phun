@@ -3,7 +3,7 @@ module Lexer where
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Char (isSpace, isDigit, chr, ord, isAlphaNum)
-import Data.Foldable (toList, find)
+import Data.Foldable (toList)
 import Numeric.Natural (Natural)
 import Data.Maybe (fromMaybe)
 import Text.Megaparsec.Stream (VisualStream(..), TraversableStream(..))
@@ -41,11 +41,15 @@ instance VisualStream [Token] where
 instance TraversableStream [Token] where
   reachOffset _ ps = (Nothing, ps) -- TODO
 
+-- If the line is not a comment and begins with a non-space character, this counts as the "start of a line", and a SOL token is emitted.
+-- This makes it so the current syntactical construct continues while the code is indented, or in other words, indentation escapes the preceding newline.
 lexLine :: Text -> [Token]
 lexLine t = toList mEol <> go t
   where
     mEol :: Maybe Token
-    mEol = SOL <$ (find (not . isSpace) . fmap fst $ T.uncons t)
+    mEol = [ SOL | not (isComment || beginsWithSpace) ]
+      where isComment = "--" `T.isPrefixOf` t
+            beginsWithSpace = fromMaybe True $ fmap (isSpace . fst) $ T.uncons t
     go (T.stripStart -> t') = case t' of
       _ | "--" `T.isPrefixOf` t' || T.null t' -> []
       (T.stripPrefix "(" -> Just rest) -> TLParen : go rest
@@ -62,7 +66,7 @@ lexLine t = toList mEol <> go t
           (ident, rest) -> fromMaybe (TIdent ident) (getType ident) : go rest
     getType :: Text -> Maybe Token
     getType = \case
-      (T.stripPrefix "Type" -> Just rest) | let index = T.takeWhile (not . isSpace) rest -> case T.unpack index of
+      (T.stripPrefix "Type" -> Just index) -> case T.unpack index of
         "" -> Just $ TType 0
         i | T.all isDigit index -> Just $ TType $ read i
           | T.all (`elem` ['₀'..'₉']) index -> Just $ TType $ read $ map subscriptToDigit $ T.unpack index
