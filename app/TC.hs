@@ -176,7 +176,7 @@ instance (Show (f (Expr f p))) => Show (Expr f p) where
 
 -- TODO pretty print
 data Error
-  -- TODO add source location
+  -- TODO add source location (possibly just decl it appears in for simplicity)
   = TypeMismatch Parsed Inferring Inferring (NonEmpty UnificationFailure)
   -- ^ source expr, expected type, actual type
   | LevelMismatch Parsed Natural Natural

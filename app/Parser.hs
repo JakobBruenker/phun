@@ -101,10 +101,9 @@ pDecl = do
 pModule :: Parser (Module PParsed)
 pModule = do
   decls <- many $ try pDecl
-  _ <- parseToken SOL
-  expr <- pUExpr
+  expr <- optional (parseToken SOL *> pUExpr)
   eof
-  pure $ Module decls $ Just expr
+  pure $ Module decls expr
 
 parseModule :: String -> [Token] -> Either (ParseErrorBundle [Token] Void) (Module PParsed)
 parseModule = parse pModule
