@@ -32,7 +32,7 @@ instance Show Token where
     TLambda -> "\\"
     TColon -> ":"
     TDot -> "."
-    THole -> "_"
+    THole -> "?"
     SOL -> "\n"
 
 instance VisualStream [Token] where
@@ -61,7 +61,7 @@ lexLine t = toList mEol <> go t
       (T.stripPrefix "λ" -> Just rest) -> TLambda : go rest
       (T.stripPrefix ":" -> Just rest) -> TColon : go rest
       (T.stripPrefix "." -> Just rest) -> TDot : go rest
-      (T.stripPrefix "_" -> Just rest) -> THole : go rest
+      (T.stripPrefix "?" -> Just rest) -> THole : go rest
       _ | otherwise -> case T.span isAlphaNum t' of
           (ident, rest) -> fromMaybe (TIdent ident) (getType ident) : go rest
     getType :: Text -> Maybe Token
