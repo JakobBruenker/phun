@@ -154,6 +154,7 @@ data Expr f p where
   App :: UExpr f p -> UExpr f p -> Expr f p -- ^ NB: This is x f, not f x
   Pi :: Id -> UExpr f p -> UExpr f p -> Expr f p
   Lam :: Id -> UExpr f p -> Expr f p
+  -- TODO dependent sum
 
   -- Technically, anything below can be encoded with the above
   -- TODO either remove or add eliminators
