@@ -151,7 +151,7 @@ data Expr f p where
   Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
 
   Var :: Id -> Expr f p
-  App :: UExpr f p -> UExpr f p -> Expr f p -- ^ NB: This is x f, not f x
+  App :: UExpr f p -> UExpr f p -> Expr f p
   Pi :: Id -> UExpr f p -> UExpr f p -> Expr f p
   Lam :: Id -> UExpr f p -> Expr f p
   -- TODO dependent sum
@@ -166,7 +166,7 @@ instance (Show (f (Expr f p))) => Show (Expr f p) where
   show (Nonsense e) = show e
 
   show (Var i) = show i
-  show (App x f) = ("(" ++ show x ++ " " ++ show f ++ ")")
+  show (App f x) = ("(" ++ show f ++ " " ++ show x ++ ")")
   show (Pi i t b) = "Π " ++ show i ++ " : " ++ show t ++ " . " ++ show b
   show (Lam i b) = "λ " ++ show i ++ " . " ++ show b
 
@@ -260,7 +260,7 @@ instance Normalize InferringExpr where
     Nonsense e -> pure (Nonsense e)
 
     Var a -> pure (Var a)
-    App x f -> App <$> normalize x <*>  normalize f
+    App f x -> App <$> normalize f <*> normalize x
     Pi i t b -> Pi i <$> normalize t <*> normalize b
     Lam i b -> Lam i <$> normalize b
 
@@ -305,7 +305,7 @@ hasUVars = \case
     go = \case
       Nonsense _ -> False
       Var _ -> False
-      App x f -> hasUVars x || hasUVars f
+      App f x -> hasUVars f || hasUVars x
       Pi _ t b -> hasUVars t || hasUVars b
       Lam _ b -> hasUVars b
       Bottom -> False
@@ -327,16 +327,16 @@ instance Unify InferringExpr where
           _ u'@(Uniq (Unique _ (Just _))) -> u'
           u _ -> u
 
-    (App x f) (App y g) -> do
-      ((f', g'), dListToList -> errs) <- listen $ (,) <$> ensureNoUVars f <*> ensureNoUVars g
+    (App f x) (App g y) -> do
       -- We only want to unify if neither f nor g have uvars, since e.g. `Top id` and `TT u1` might be unifiable if u1 is actually a function that gets the type of its arg
       -- TODO However, this makes us order dependent? Whether it contains a uvar might depend on what else we unify first
+      ((f', g'), dListToList -> errs) <- listen $ (,) <$> ensureNoUVars f <*> ensureNoUVars g
       case NE.nonEmpty errs of
-        Just _ -> pure $ App x f
+        Just _ -> pure $ App f x
         Nothing -> do
           f'' <- unify' f' g'
           x' <- unify' x y
-          pure $ App x' f''
+          pure $ App f'' x'
       where
         ensureNoUVars :: Inferring -> WriterT (DList UnificationFailure) TcM Inferring
         ensureNoUVars e = do
@@ -422,7 +422,7 @@ instance Zonk InferringExpr where
     Nonsense e -> pure (Nonsense e)
 
     Var a -> pure (Var a)
-    App x f -> App <$> zonk x <*> zonk f
+    App f x -> App <$> zonk f <*> zonk x
     Pi i t b -> Pi i <$> zonk t <*> zonk b
     Lam i b -> Lam i <$> zonk b
 
@@ -438,7 +438,7 @@ instance Rename InferringExpr where
     Nonsense e -> pure (Nonsense e)
 
     Var a -> pure (Var (if a == orig then new else a))
-    App x f -> App <$> rename' orig new x <*> rename' orig new f
+    App f x -> App <$> rename' orig new f <*> rename' orig new x
     Pi i t b -> Pi i <$> rename' orig new t <*> if i == orig then pure b else rename' orig new b
     Lam i b -> Lam i <$> if i == orig then pure b else rename' orig new b
 
@@ -473,7 +473,7 @@ substVar x a = \case
       Nonsense e -> Nonsense e
 
       Var v -> Var v
-      App e f -> App (substVar x a e) (substVar x a f)
+      App f e -> App (substVar x a f) (substVar x a e)
       Pi i t b -> Pi i (substVar x a t) if x == i then b else substVar x a b
       Lam x' b -> Lam x' if x == x' then b else substVar x a b
 
@@ -491,7 +491,7 @@ toChecked = \case
         lift . raise $ HasNonsense p
         hoistMaybe Nothing
       Var a -> pure $ Var a
-      App x f -> App <$> toChecked x <*> toChecked f
+      App f x -> App <$> toChecked f <*> toChecked x
       Pi x a b -> Pi x <$> toChecked a <*> toChecked b
       Lam x b -> Lam x <$> toChecked b
 
@@ -545,7 +545,7 @@ check expected expr = case expr of
       varType <- lookupVarType a
       ty <- tryUnify expr expected varType
       pure $ Expr (Var a ::: ty)
-    App x f -> do
+    App f x -> do
       i <- Uniq <$> freshUnique Nothing
       a <- UV <$> freshUVar
       b <- UV <$> freshUVar
@@ -553,7 +553,7 @@ check expected expr = case expr of
       f' <- check (Expr (Pi i a b ::: k)) f
       x' <- check a x
       b' <- tryUnify f expected $ substVar i x' b
-      pure (Expr $ App x' f' ::: b')
+      pure (Expr $ App f' x' ::: b')
     Pi x a b -> do
       a' <- infer a
       b' <- withBinding x a' $ infer b
@@ -607,14 +607,14 @@ infer expr = case expr of
     Var a -> do
       varT <- lookupVarType a
       pure (Expr $ Var a ::: varT)
-    App x f -> do
+    App f x -> do
       a <- UV <$> freshUVar
       b <- UV <$> freshUVar
       i <- Uniq <$> freshUnique Nothing
       k <- UV <$> freshUVar
       f' <- check (Expr (Pi i a b ::: k)) f
       x' <- check a x
-      pure (Expr $ App x' f' ::: substVar i x' b)
+      pure (Expr $ App f' x' ::: substVar i x' b)
     Pi x a b -> do
       a' <- infer a
       b' <- withBinding x a' $ infer b
@@ -689,14 +689,14 @@ step' @p = \case
       Nonsense e' -> pure . withType $ Nonsense e'
 
       Var a -> pure . withType $ Var a
-      App x f -> do
+      App f x -> do
         f' <- eval f
         x' <- eval x
         case f' of
           Expr (extract -> Lam i rhs) -> do
             tellHasReduced
             step $ substVar i x' rhs
-          _ -> pure . withType $ App x' f'
+          _ -> pure . withType $ App f' x'
       Pi x a b -> do
         a' <- step' a
         b' <- step' b
