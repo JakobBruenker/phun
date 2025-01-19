@@ -1,12 +1,15 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE CPP #-}
+
+#define UNICODE
 
 module TC where
 
 import Control.Monad (when, (>=>), join)
 import Control.Monad.Reader (MonadReader (..))
-import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
+import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS, get)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..), hoistMaybe)
 import Control.Monad.Trans.Writer.CPS (WriterT, Writer, listen, runWriterT)
@@ -32,6 +35,7 @@ import qualified Data.Text as T
 import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
 import GHC.Records (HasField (..))
+import Debug.Trace (traceShowM)
 
 type Module :: Pass -> Type
 data Module p = Module 
@@ -96,12 +100,24 @@ type UVar = UVar' PInferring
 deriving instance Eq (UVar' p)
 
 instance Show UVar where
-  show (UVar i) = "υ" ++ ['₋' | i < 0] ++  showNaturalSubscript (fromIntegral (abs i))
+  show (UVar i) =
+#ifdef UNICODE
+    "υ"
+#else
+    "u"
+#endif
+    ++ ['₋' | i < 0] ++  showNaturalSubscript (fromIntegral (abs i))
 
 showNaturalSubscript :: Natural -> String
 showNaturalSubscript = map toSubscript . show
   where
-    toSubscript c = chr (ord c - ord '0' + ord '₀')
+    toSubscript c = chr (ord c - ord '0' + ord
+#ifdef UNICODE
+      '₀'
+#else
+      '0'
+#endif
+      )
 
 data Id = Name Text | Uniq Unique deriving (Eq, Ord)
 
@@ -184,12 +200,24 @@ instance Show (f (Expr f p)) => Show (Expr f p) where
 
     Var i -> show i
     App f x -> ("(" ++ show f ++ " " ++ show x ++ ")")
-    Pi i t b -> "Π " ++ show i ++ " : " ++ show t ++ " . " ++ show b
-    Lam i b -> "λ " ++ show i ++ " . " ++ show b
+    Pi i t b -> sPi ++ " " ++ show i ++ " : " ++ show t ++ " . " ++ show b
+    Lam i b -> sLam ++ " " ++ show i ++ " . " ++ show b
 
-    Bottom -> "⊥"
-    Top -> "⊤"
+    Bottom -> sBot
+    Top -> sTop
     TT -> "tt"
+    where
+#ifdef UNICODE
+      sPi = "Π"
+      sLam = "λ"
+      sBot = "⊥"
+      sTop = "⊤"
+#else
+      sPi = "Pi"
+      sLam = "\\"
+      sBot = "_|_"
+      sTop = "T"
+#endif
 
 -- TODO pretty print
 data Error
@@ -219,7 +247,7 @@ data TcState = TcState
   { nextUVar :: Int
   , nextUnique :: Natural
   , subst :: IntMap Inferring
-  }
+  } deriving Show
 
 type VarTypes a = Map Id a
 
@@ -538,6 +566,9 @@ inferModule (Module declarations mainExpr) = case declarations of
 checkModule :: Module PParsed -> TcM (Maybe (Module PChecked))
 checkModule mod' = do
   Module decls mainExpr <- inferModule mod'
+  get >>= traceShowM
+  traceShowM decls
+  traceShowM mainExpr
   runMaybeT $ Module
     <$> traverse checkDecl decls
     <*> traverse toChecked mainExpr
