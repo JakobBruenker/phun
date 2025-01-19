@@ -220,10 +220,8 @@ instance Show (f (Expr f p)) => Show (Expr f p) where
 -- TODO pretty print
 data Error
   -- TODO add source location (possibly just decl it appears in for simplicity)
-  = TypeMismatch Parsed Inferring Inferring (NonEmpty UnificationFailure)
-  -- ^ source expr, expected type, actual type
-  | LevelMismatch Parsed Natural Natural
-  -- ^ source expr, expected level, actual level
+  = TypeMismatch { sourceExpr :: Parsed, expected :: Inferring, actual :: Inferring, unifFails :: (NonEmpty UnificationFailure)}
+  | LevelMismatch { sourceExpr :: Parsed, expectedLevel :: Natural, actualLevel :: Natural }
   | VarOutOfScope Id
   | NoTypeForUVar UVar
   | NoLevelForUVar UVar
@@ -707,8 +705,7 @@ typeOf = \case
 
 class (NotParsed p, MonadReader (Vars (UExpr (Typed p) p)) (PassMonad p)) => Eval p where
   type PassMonad p :: Type -> Type
-  -- NB: Instead of this, we could also just ensure it's zonked before it's evaled
-  provideUVar :: UVar' p -> (PassMonad p) (UExpr (Typed p) p)
+  zonkUnchecked :: UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
   evalTypes :: Bool
 
 class NotParsed p where notParsed :: p :~: PParsed -> Void
@@ -719,20 +716,23 @@ data WasReduced = WasReduced deriving Show
 
 instance Semigroup WasReduced where _ <> _ = WasReduced
 
+-- | Brings an expression to normal form
 eval :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) m e
-eval e = do
-  (e', wasReduced) <- listen $ step e
-  if isJust wasReduced then eval e' else pure e'
+eval = lift . zonkUnchecked >=> go
+  where
+    go e = do
+      (e', wasReduced) <- listen $ step e
+      if isJust wasReduced then go e' else pure e'
 
 instance Eval PInferring where
   type PassMonad PInferring = TcM
-  provideUVar = normalizeUVar
   evalTypes = True
+  zonkUnchecked = zonk
 
 instance Eval PChecked where
   type PassMonad PChecked = Reader (Vars Checked)
-  provideUVar = \case
   evalTypes = False
+  zonkUnchecked = pure
 
 type HasVars :: (Type -> Type) -> Constraint
 class HasVars m where
@@ -776,7 +776,7 @@ step @p = \case
       Top -> pure . withType $ Top
       TT -> pure . withType $ TT
     pure e'
-  UV u -> lift (provideUVar u)
+  UV u -> pure $ UV u
   Hole -> absurd $ notParsed Refl
   where
     tellHasReduced = tell (Just WasReduced)
