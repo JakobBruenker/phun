@@ -3,4 +3,4 @@ id : ΠA:Type.Πx:A.A
 
 -- test comment
 
-id (λx.x) -- another comment
+id _ (λx.x) -- another comment

@@ -30,10 +30,11 @@ import Data.Text (Text)
 import Data.Type.Equality ((:~:) (..))
 import Data.Void (Void, absurd)
 import GHC.Natural (Natural)
-import qualified Data.Text as T
+import Data.Text qualified as T
 import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
 import GHC.Records (HasField (..))
+import Data.List qualified as L
 
 -- TODO if a function is used in different places, do we have to make sure to use different uvars so it's actually generalized? Test by using id at different types.
 -- TODO This is probably only an issue if uvars remain in the declaration after inference, which maybe shouldn't be allowed to begin with
@@ -53,7 +54,9 @@ data Decl p = Decl
   , defTerm :: PassUExpr p
   }
 
-deriving instance (Show (DeclType p), Show (PassUExpr p)) => Show (Decl p)
+instance (Show (DeclType p), Show (PassUExpr p)) => Show (Decl p) where
+  show (Decl name ty term) = show name ++ " : " ++ show ty ++ "\n" ++ show term
+  showList decls = ('\n' :) . (L.intercalate "\n\n" (map show decls) ++) . ('\n' :)
 
 -- We only need to keep track of the type in Parsed, since otherwise it's included in the term
 type DeclType :: Pass -> Type
@@ -254,6 +257,7 @@ type Vars a = Map Id (TypeOrTerm a)
 -- | Typechecker monad.
 type TcM = RWS (Vars Inferring) (DList Error) TcState
 
+-- TODO actually since we're always adding single elements we probably don't need a DList
 newtype DList a = DList (Endo [a]) deriving (Semigroup, Monoid) via (Endo [a])
 
 emptyDList :: DList a
