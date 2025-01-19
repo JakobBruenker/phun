@@ -3,7 +3,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE CPP #-}
 
-#define UNICODE
+-- #define UNICODE
 
 module TC where
 
@@ -35,7 +35,7 @@ import qualified Data.Text as T
 import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
 import GHC.Records (HasField (..))
-import Debug.Trace (traceShowM)
+import Debug.Trace (traceShowM, traceM)
 
 type Module :: Pass -> Type
 data Module p = Module 
@@ -527,7 +527,7 @@ substVar x a = \case
       TT -> TT
 
 toChecked :: Inferring -> MaybeT TcM Checked
-toChecked = \case
+toChecked = lift . zonk >=> \case
   Univ n -> pure $ Univ n
   Expr (e ::: t) -> do
     t' <- toChecked t
@@ -662,12 +662,16 @@ infer expr = case expr of
       varT <- lookupVarType a
       pure (Expr $ Var a ::: varT)
     App f x -> do
+      traceM "infer app"
+      traceShowM f
+      traceShowM x
       a <- UV <$> freshUVar
       b <- UV <$> freshUVar
       i <- Uniq <$> freshUnique Nothing
       k <- UV <$> freshUVar
       f' <- check (Expr (Pi (Id i) a b ::: k)) f
       x' <- check a x
+      traceShowM $ substVar i x' b
       pure (Expr $ App f' x' ::: substVar i x' b)
     Pi x' a b -> do
       x <- case x' of
