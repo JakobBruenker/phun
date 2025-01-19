@@ -9,7 +9,7 @@ module TC where
 
 import Control.Monad (when, (>=>), join)
 import Control.Monad.Reader (MonadReader (..))
-import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS, get)
+import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..), hoistMaybe)
 import Control.Monad.Trans.Writer.CPS (WriterT, Writer, listen, runWriterT)
@@ -35,7 +35,6 @@ import qualified Data.Text as T
 import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
 import GHC.Records (HasField (..))
-import Debug.Trace (traceShowM, traceM)
 
 type Module :: Pass -> Type
 data Module p = Module 
@@ -142,9 +141,7 @@ tagUnique (Unique n _) name = Unique n (Just name)
 
 instance Show Id where
   show (Name name) = T.unpack name
-  show (Uniq (Unique n name)) = maybe uniq (\n' -> T.unpack n' ++ uniq) name
-    where
-      uniq = showNaturalSubscript n
+  show (Uniq (Unique n name)) = maybe "v" T.unpack name ++ showNaturalSubscript n
 
 data Pass = PParsed | PInferring | PChecked
 
@@ -425,7 +422,7 @@ instance Unify Inferring where
     where
       go :: Inferring -> Inferring -> WriterT (DList UnificationFailure) TcM Inferring
       go = \cases
-        (Univ n) (Univ n') -> when (n /= n) (raiseUnif $ Can'tUnifyLevels n n') *> pure (Univ n)
+        (Univ n) (Univ n') -> when (n /= n') (raiseUnif $ Can'tUnifyLevels n n') *> pure (Univ n)
         (UV u) (UV u')
           | u == u' -> pure (UV u)
           | otherwise -> lift (substUVar u' (UV u)) >> pure (UV u) -- order doesn't really matter, but it seems reasonable to take the expected as "ground truth"
@@ -566,9 +563,6 @@ inferModule (Module declarations mainExpr) = case declarations of
 checkModule :: Module PParsed -> TcM (Maybe (Module PChecked))
 checkModule mod' = do
   Module decls mainExpr <- inferModule mod'
-  get >>= traceShowM
-  traceShowM decls
-  traceShowM mainExpr
   runMaybeT $ Module
     <$> traverse checkDecl decls
     <*> traverse toChecked mainExpr
@@ -582,7 +576,7 @@ check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   Univ n -> do
     let uType = Univ (n + 1)
-    (ty, errs) <- unify expected $ Univ (n + 1)
+    (ty, errs) <- unify expected uType
     case NE.nonEmpty errs of
       Nothing -> pure $ Univ n
       Just es -> do
@@ -634,7 +628,7 @@ check expected expr = case expr of
     Bottom -> Expr . (Bottom :::) <$> tryUnify expr expected (Univ 0)
     Top -> Expr . (Top :::) <$> tryUnify expr expected (Univ 0)
     TT -> Expr . (TT :::) <$> tryUnify expr expected (Expr (Top ::: Univ 0))
-  Hole -> UV <$> freshUVar -- XXX Is this right? It seems like we ignore the expected type. But maybe this will just always result in an unsolved uvar, which might be fine. Otherwise, possibly UVars need to be able to optionally have types
+  Hole -> UV <$> freshUVar -- XXX Is this right? It seems like we ignore the expected type. But maybe this will just always result in an unsolved uvar, which might be fine. Otherwise, possibly UVars need to be able to optionally have types. Or a substType that's queried if there is no substTerm for that uvar
   
 tryUnify :: Parsed -> Inferring -> Inferring -> TcM Inferring
 tryUnify expr expt act = do
@@ -662,16 +656,12 @@ infer expr = case expr of
       varT <- lookupVarType a
       pure (Expr $ Var a ::: varT)
     App f x -> do
-      traceM "infer app"
-      traceShowM f
-      traceShowM x
       a <- UV <$> freshUVar
       b <- UV <$> freshUVar
       i <- Uniq <$> freshUnique Nothing
       k <- UV <$> freshUVar
       f' <- check (Expr (Pi (Id i) a b ::: k)) f
       x' <- check a x
-      traceShowM $ substVar i x' b
       pure (Expr $ App f' x' ::: substVar i x' b)
     Pi x' a b -> do
       x <- case x' of

@@ -28,6 +28,8 @@ main = do
       case runTcM $ checkModule md of
         (_, NE.nonEmpty -> Just errs) -> for_ errs (hPrint stderr)
         (Just (Module _ (Just expr)), _) -> do
+          -- debugging
+          putStrLn "printing eval'd expr"
           print . fst . runWriter $ eval @PChecked expr
         _foo -> do
           -- debugging
