@@ -6,10 +6,11 @@ import TC
 import System.Environment (getArgs)
 import Data.Text.IO qualified as T
 import Text.Megaparsec.Error (errorBundlePretty)
-import qualified Data.List.NonEmpty as NE
+import Data.List.NonEmpty qualified as NE
 import Data.Foldable (for_)
-import Control.Monad.Trans.Writer.CPS (runWriter)
+import Control.Monad.Trans.Writer.CPS (runWriterT)
 import System.IO (hPrint, stderr, hPutStrLn)
+import Control.Monad.Reader (runReader)
 
 main :: IO ()
 main = do
@@ -27,10 +28,10 @@ main = do
       print md
       case runTcM $ checkModule md of
         (_, NE.nonEmpty -> Just errs) -> for_ errs (hPrint stderr)
-        (Just (Module _ (Just expr)), _) -> do
+        (Just mod'@(Module _ (Just expr)), _) -> do
           -- debugging
           putStrLn "printing eval'd expr"
-          print . fst . runWriter $ eval @PChecked expr
+          print . fst . flip runReader (extractDecls mod') . runWriterT $ eval @PChecked expr -- TODO actually M.empty is not right here, we need the decls
         _foo -> do
           -- debugging
           print _foo

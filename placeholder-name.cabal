@@ -28,6 +28,7 @@ executable placeholder-name
                         MonadComprehensions,
                         TypeAbstractions,
                         ViewPatterns,
+                        DerivingVia,
     other-modules: Lexer, Parser, TC
     -- other-extensions:
     build-depends:    base ^>=4.20.0.0,
