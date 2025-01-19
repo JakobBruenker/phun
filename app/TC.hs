@@ -8,6 +8,7 @@ module TC where
 import Control.Monad (when, (>=>), join)
 import Control.Monad.Reader (MonadReader (..), Reader)
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS, MonadWriter)
+import Control.Monad.RWS qualified as RWS
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT(..), hoistMaybe)
 import Control.Monad.Trans.Writer.CPS (WriterT, listen, runWriterT)
@@ -166,9 +167,10 @@ data Expr f p where
   Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
 
   Var :: Id -> Expr f p
-  App :: UExpr f p -> UExpr f p -> Expr f p
+
   Pi :: IdOrWildcard p -> UExpr f p -> UExpr f p -> Expr f p
   Lam :: IdOrWildcard p -> UExpr f p -> Expr f p
+  App :: UExpr f p -> UExpr f p -> Expr f p
   -- TODO dependent sum
 
   -- Technically, anything below can be encoded with the above
@@ -338,10 +340,12 @@ class Unify a where
   -- | Intended argument order: Expected, then actual
   unify' :: a -> a -> WriterT (DList UnificationFailure) TcM a
 
--- TODO probably reduce here? To avoid trying to reduce on every recursive call of unify'
 -- TODO Q: What happens if e.g. in App we unify left side first, but actually right side contains information we need to successfully unify left side?
 unify :: Inferring -> Inferring -> TcM (Inferring, [UnificationFailure])
-unify e e' = second dListToList <$> runWriterT (unify' e e')
+unify e e' = do
+  re <- eval_ e
+  re' <- eval_ e'
+  second dListToList <$> runWriterT (unify' re re')
 
 hasUVars :: Inferring -> Bool
 hasUVars = \case
@@ -716,6 +720,9 @@ data WasReduced = WasReduced deriving Show
 
 instance Semigroup WasReduced where _ <> _ = WasReduced
 
+eval_ :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> m e
+eval_ = fmap fst . runWriterT . eval
+
 -- | Brings an expression to normal form
 eval :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) m e
 eval = lift . zonkUnchecked >=> go
@@ -764,7 +771,7 @@ step @p = \case
         case f' of
           Expr (extract -> Lam i rhs) -> do
             tellHasReduced
-            step $ substVar i.id x' rhs
+            step $ substVar i.id x' rhs -- TODO use withBinding here?
           _ -> pure . withType $ App f' x'
       Pi x a b -> do
         a' <- step a
@@ -782,5 +789,25 @@ step @p = \case
     tellHasReduced = tell (Just WasReduced)
 
 runTcM :: TcM a -> (a, [Error])
-runTcM action = runRWS action M.empty (TcState 0 0 IM.empty) & \case
-  (a, _, w) -> (a, dListToList w)
+runTcM @a action = runRWS withZonkedErrors M.empty (TcState 0 0 IM.empty) &
+  \((a, errs), _, _) -> (a, errs)
+  where
+    -- By zonking at the very end, we can ensure the errors contain all useful data
+    withZonkedErrors :: TcM (a, [Error])
+    withZonkedErrors = do
+      (a, errs) <- RWS.listen action
+      traverse zonkError (dListToList errs) >>= pure . (a,)
+
+    zonkError :: Error -> TcM Error
+    zonkError = \case
+      TypeMismatch e expt act errs -> TypeMismatch e <$> zonk act <*> zonk expt <*> traverse zonkUFails errs
+      e -> pure e
+
+    zonkUFails :: UnificationFailure -> TcM UnificationFailure
+    zonkUFails = \case
+      Can'tUnifyTypes expt act -> Can'tUnifyTypes <$> zonk act <*> zonk expt
+      Can'tUnifyExprs expt act -> Can'tUnifyExprs <$> zonk act <*> zonk expt
+      Can'tUnifyNonsense expt act -> pure $ Can'tUnifyNonsense expt act
+      Can'tUnifyVars v v' -> pure $ Can'tUnifyVars v v'
+      Can'tUnifyLevels l l' -> pure $ Can'tUnifyLevels l l'
+      Can'tUnifyUVarInApp e -> Can'tUnifyUVarInApp <$> zonk e

@@ -1,6 +1,6 @@
 id : ΠA:Type.Πx:A.A
-\t.\x.x
+λt.λx.x
 
 -- test comment
 
-id (\x.x) -- another comment
+id (λx.x) -- another comment
