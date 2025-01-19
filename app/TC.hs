@@ -3,8 +3,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE CPP #-}
 
--- #define UNICODE
-
 module TC where
 
 import Control.Monad (when, (>=>), join)
