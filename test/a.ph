@@ -7,5 +7,5 @@
 reflect : Π_:Type.Type
 \t.t
 
-foo : _ -- why does this only work with the type annotation?
+-- foo : _ -- why does this only work with the type annotation?
 reflect Type₂

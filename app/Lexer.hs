@@ -5,7 +5,7 @@ import Data.Text qualified as T
 import Data.Foldable (toList)
 import Data.Maybe (fromMaybe)
 import Text.Megaparsec.Stream (VisualStream(..), TraversableStream(..))
-import Data.List (intercalate, List)
+import Data.List (intercalate)
 import Data.Char (isSpace, isAlphaNum)
 
 data Token
@@ -56,7 +56,7 @@ lexLine t = toList mEol <> go t
       (T.stripPrefix "λ" -> Just rest) -> TLambda : go rest
       (T.stripPrefix ":" -> Just rest) -> TColon : go rest
       (T.stripPrefix "." -> Just rest) -> TDot : go rest
-      _ | let (ident, rest) = T.span (\c -> isAlphaNum c || elem @List c ",?_'" ) t' -> TIdent ident  : go rest
+      _ | let (ident, rest) = T.span (\c -> isAlphaNum c || T.elem c ",?_'" ) t' -> TIdent ident  : go rest
 
 lexFile :: Text -> [Token]
 lexFile = concat . fmap lexLine . T.lines
