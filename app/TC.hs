@@ -691,11 +691,16 @@ infer expr = case expr of
       x <- case x' of
         Id i -> pure i
         Wildcard -> Uniq <$> freshUnique Nothing
-      a <- UV <$> freshUVar
+      aUV <- freshUVar
+      let a = UV aUV
       b' <- withBinding x (Type a) $ infer b
       bt <- typeOf b'
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel bt)
       -- TODO Q: If we later substitute x in bt, does that mean inference has to be able to use x in bt? Maybe not, if we say dependent types can't be inferred
+      -- TODO do we need this to be able to infer a type for e.g. \x.x?
+      -- TODO idea for that: Wrap infer lambda with something that checks if the bound var is not subst'd, and then make a Pi if so
+      -- TODO except it doesn't quite work like that, because we have no inferred arguments. So \x.x cannot be generalized. What about \t.\x.the t x?
+      -- TODO we could decide to default to Type in a case like \x.x
       pure (Expr $ Lam (Id x) b' ::: Expr (Pi (Id x) a bt ::: Univ lvl))
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)

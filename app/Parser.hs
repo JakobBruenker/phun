@@ -26,26 +26,15 @@ parens = between (parseToken TLParen) (parseToken TRParen)
 
 pUExpr :: Parser Parsed
 pUExpr = choice
-  [ Expr . Identity <$> pExprNoVar
-  , pOtherUExpr
+  [ try pApp
+  , pUExprNoApp
   ]
 
 pUExprNoApp :: Parser Parsed
 pUExprNoApp = choice
   [ Expr . Identity <$> pExprNoAppOrVar
-  , pOtherUExpr
-  ]
-
-pOtherUExpr :: Parser Parsed
-pOtherUExpr = choice
-  [ pVarOrUnivOrHole
+  , pVarOrUnivOrHole
   , parens pUExpr
-  ]
-
-pExprNoVar :: Parser ParsedExpr
-pExprNoVar = choice
-  [ try pApp
-  , pExprNoAppOrVar
   ]
 
 pExprNoAppOrVar :: Parser ParsedExpr
@@ -93,8 +82,11 @@ name = identifier >>= \case
   IVar t -> pure t
   _ -> fail "Expected variable name"
 
-pApp :: Parser ParsedExpr
-pApp = App <$> pUExprNoApp <*> pUExpr
+pApp :: Parser Parsed
+pApp = do
+  f <- pUExprNoApp
+  xs <- some pUExprNoApp
+  pure $ foldl' (\a b -> Expr . Identity $ App a b) f xs
 
 pPi :: Parser ParsedExpr
 pPi = do
