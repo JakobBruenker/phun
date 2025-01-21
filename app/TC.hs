@@ -35,6 +35,7 @@ import Control.Comonad (Comonad (..))
 import Data.Maybe (isJust)
 import GHC.Records (HasField (..))
 import Data.List qualified as L
+import Control.Applicative ((<|>))
 
 -- TODO if a function is used in different places, do we have to make sure to use different uvars so it's actually generalized? Test by using id at different types.
 -- TODO This is probably only an issue if uvars remain in the declaration after inference, which maybe shouldn't be allowed to begin with
@@ -128,6 +129,7 @@ data Id = Name Text | Uniq Unique deriving (Eq, Ord)
 -- | Gets the user-defined name of an identifier, if it has one
 userName :: Id -> Maybe Text
 userName (Name n) = Just n
+userName (Uniq (Unique _ (Just n))) = Just n
 userName _ = Nothing
 
 data Unique = Unique
@@ -169,6 +171,7 @@ type Expr :: (Type -> Type) -> Pass -> Type
 data Expr f p where
   Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
 
+  -- TODO I think Var can be a UExpr. The type is stored in the context.
   Var :: Id -> Expr f p
 
   Pi :: IdOrWildcard p -> UExpr f p -> UExpr f p -> Expr f p
@@ -232,6 +235,7 @@ data Error
   | NoLevelForUVar UVar
   | HasNonsense Parsed
   | StillHasUnifs UVar
+  | Bug Text -- ^ Unexpected error indicating a compiler bug
   deriving Show
 
 -- TODO add details
@@ -250,7 +254,7 @@ data TcState = TcState
   , subst :: IntMap Inferring -- unification vars
   } deriving Show
 
-data TypeOrTerm a = Type a | Term a
+data TypeOrTerm a = Type a | Term a deriving Show
 
 type Vars a = Map Id (TypeOrTerm a)
 
@@ -284,8 +288,8 @@ normalizeUVar v = do
   t <- lookupUVar v
   case t of
     Nothing -> pure (UV v)
-    Just (UV v') -> normalizeUVar v' -- TODO maybe zonk in this case
-    Just t' -> pure t'
+    Just (UV v') -> normalizeUVar v'
+    Just t' -> normalize t'
 
 withBinding :: MonadReader (Vars v) m => Id -> (TypeOrTerm v) -> m a -> m a
 withBinding i t = local (M.insert i t)
@@ -306,39 +310,46 @@ lookupVarTerm i = lookupVar i <&> \case
   Just (Term t) -> Just t
   _ -> Nothing
 
-class Normalize a where
-  normalize :: a -> TcM a
-
-instance Normalize InferringExpr where
-  -- TODO we probably have to actually normalize here i.e. eval the exprs, not just replace the UVars - Q: Can we ensure we only get strongly normalizing terms here?
-  normalize :: InferringExpr -> TcM InferringExpr
-  normalize = \case
-    Nonsense e -> pure (Nonsense e)
-
-    Var a -> pure (Var a)
-    App f x -> App <$> normalize f <*> normalize x
-    Pi i t b -> Pi i <$> normalize t <*> normalize b
-    Lam i b -> Lam i <$> normalize b
-
-    Bottom -> pure Bottom
-    Top -> pure Top
-    TT -> pure TT
-
-instance Normalize u => Normalize (Typed PInferring u) where
-  normalize :: Typed PInferring u -> TcM (Typed PInferring u)
-  normalize (t ::: k) = do
+-- | Replace any UVars and Vars with their most concrete representation
+normalize :: Inferring -> TcM Inferring
+normalize = \case
+  Univ n -> pure (Univ n)
+  Expr (Var i ::: t) -> do
+    lookupVar i >>= \case
+      Just (Term e') -> normalize e'
+      _ -> do
+        t' <- normalize t
+        pure $ Expr (Var i ::: t')
+  Expr (e ::: t) -> do
+    e' <- normalizeExpr e
     t' <- normalize t
-    k' <- normalize k
-    pure (t' ::: k')
+    pure $ Expr (e' ::: t')
+  UV v -> normalizeUVar v
+  where
+    normalizeExpr :: InferringExpr -> TcM InferringExpr
+    normalizeExpr = \case
+      Nonsense e -> pure (Nonsense e)
 
-instance Normalize Inferring where
-  -- | Normalize all UVars in a type
-  -- TODO maybe zonk here - although I'm not sure it makes much sense because we don't always keep this result
-  normalize :: Inferring -> TcM Inferring
-  normalize = \case
-    Univ n -> pure (Univ n)
-    Expr e -> Expr <$> normalize e
-    UV v -> normalizeUVar v
+      Var a -> pure (Var a) -- impossible
+      App f x -> App <$> normalize f <*> normalize x
+      Pi i t b -> Pi i <$> normalize t <*> normalize b
+      Lam i b -> Lam i <$> normalize b
+
+      Bottom -> pure Bottom
+      Top -> pure Top
+      TT -> pure TT
+
+
+-- instance Normalize u => Normalize (Typed PInferring u) where
+--   normalize :: Typed PInferring u -> TcM (Typed PInferring u)
+--   normalize (t ::: k) = do
+--     t' <- normalize t
+--     k' <- normalize k
+--     pure (t' ::: k')
+
+-- instance Normalize Inferring where
+--   -- | Normalize all UVars in a type
+--   -- TODO maybe zonk here - although I'm not sure it makes much sense because we don't always keep this result
 
 class Unify a where
   -- | Intended argument order: Expected, then actual
@@ -380,6 +391,7 @@ instance Unify InferringExpr where
           u@(Uniq (Unique _ (Just _))) _ -> u
           u@(Name _) _ -> u
           _ u'@(Uniq (Unique _ (Just _))) -> u'
+          _ u'@(Name _) -> u'
           u _ -> u
 
     (App f x) (App g y) -> do
@@ -401,12 +413,12 @@ instance Unify InferringExpr where
     (Pi x a b) (Pi x' a' b') -> do
       a'' <- unify' a a'
       u <- lift $ freshUnique Nothing
-      let uniq = Uniq u{tag = userName x.id}
+      let uniq = Uniq u{tag = userName x.id <|> userName x'.id}
       b'' <- join $ unify' <$> lift (rename x.id uniq b) <*> lift (rename x'.id uniq b')
       pure $ Pi (Id uniq) a'' b''
     (Lam x b) (Lam x' b') -> do
       u <- lift $ freshUnique Nothing
-      let uniq = Uniq u{tag = userName x.id}
+      let uniq = Uniq u{tag = userName x.id <|> userName x'.id}
       b'' <- join $ unify' <$> lift (rename x.id uniq b) <*> lift (rename x'.id uniq b')
       pure $ Lam (Id uniq) b''
 
@@ -460,6 +472,7 @@ freshUnique name = do
   modify' \s -> s{nextUnique = u + 1}
   pure $ Unique u name
 
+-- TODO wait a minute... Is zonk just normalize at this point
 class Zonk a where
   zonk :: a -> TcM a
 
@@ -516,6 +529,7 @@ instance Rename Inferring where
 rename :: (Rename a, Zonk a) => Id -> Id -> a -> TcM a
 rename orig new = zonk >=> rename' orig new
 
+-- TODO maybe just remove and use withBinding wherever it's used
 substVar :: (NotParsed p, Comonad f) => Id -> UExpr f p -> UExpr f p -> UExpr f p
 substVar x a = \case
   Univ n -> Univ n
@@ -610,7 +624,7 @@ check expected expr = case expr of
       k <- UV <$> freshUVar
       f' <- check (Expr (Pi (Id i) a b ::: k)) f
       x' <- check a x
-      b' <- tryUnify f expected $ substVar i x' b
+      b' <- tryUnify f expected =<< fillInArg x' =<< typeOf f'
       pure (Expr $ App f' x' ::: b')
     Pi x' a b -> do
       x <- case x' of
@@ -663,6 +677,17 @@ inferLevel = \case
       pure Nothing
     t -> inferLevel t
 
+-- | fills in the argument of a Pi type or Lambda if the given expression is
+-- one, returning the body. For other expressions, returns the expression
+-- unchanged, but raises an error. Also fills in any other variables and uvars
+-- in the body that can be filled in.
+fillInArg :: Inferring -> Inferring -> TcM Inferring
+fillInArg filler (Expr (Pi x _ b ::: _)) = withBinding x.id (Term filler) $ normalize b
+fillInArg filler (Expr (Lam x b ::: _)) = withBinding x.id (Term filler) $ normalize b
+fillInArg _ e = do
+  raise $ Bug $ "fillInArg called with non-Pi/Lam expression: " <> T.pack (show e)
+  pure e
+
 -- infer should not use unify, and instead call check.
 infer :: Parsed -> TcM Inferring
 infer expr = case expr of
@@ -678,7 +703,8 @@ infer expr = case expr of
       k <- UV <$> freshUVar
       f' <- check (Expr (Pi (Id i) a b ::: k)) f
       x' <- check a x
-      pure (Expr $ App f' x' ::: substVar i x' b)
+      b' <- fillInArg x' =<< typeOf f'
+      pure (Expr $ App f' x' ::: b')
     Pi x' a b -> do
       x <- case x' of
         Id i -> pure i
@@ -773,7 +799,7 @@ step @p = \case
       Var a -> do
         lookupVar a <&> \case
           Just (Term term) -> term
-          _ -> withType $ Var a -- We allow using vars that are out of scope, it'll just not be reduced
+          _ -> withType $ Var a -- We allow using vars that are out of scope here, it'll just not be reduced
       App f x -> do
         f' <- eval f
         x' <- eval x
