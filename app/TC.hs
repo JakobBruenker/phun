@@ -529,27 +529,6 @@ instance Rename Inferring where
 rename :: (Rename a, Zonk a) => Id -> Id -> a -> TcM a
 rename orig new = zonk >=> rename' orig new
 
--- TODO maybe just remove and use withBinding wherever it's used
-substVar :: (NotParsed p, Comonad f) => Id -> UExpr f p -> UExpr f p -> UExpr f p
-substVar x a = \case
-  Univ n -> Univ n
-  Expr (extract -> Var x') | x == x' -> a
-  Expr e -> Expr $ substVarExpr <$> e
-  UV u -> UV u
-  Hole -> Hole
-  where
-    substVarExpr = \case
-      Nonsense e -> Nonsense e
-
-      Var v -> Var v
-      App f e -> App (substVar x a f) (substVar x a e)
-      Pi i t b -> Pi i (substVar x a t) if x == i.id then b else substVar x a b
-      Lam x' b -> Lam x' if x == x'.id then b else substVar x a b
-
-      Bottom -> Bottom
-      Top -> Top
-      TT -> TT
-
 toChecked :: Inferring -> MaybeT TcM Checked
 toChecked = lift . zonk >=> \case
   Univ n -> pure $ Univ n
@@ -677,13 +656,12 @@ inferLevel = \case
       pure Nothing
     t -> inferLevel t
 
--- | fills in the argument of a Pi type or Lambda if the given expression is
--- one, returning the body. For other expressions, returns the expression
--- unchanged, but raises an error. Also fills in any other variables and uvars
--- in the body that can be filled in.
+-- | fills in the argument of a Pi type if the given expression is one,
+-- returning the body. For other expressions, returns the expression unchanged,
+-- but raises an error. Also fills in any other variables and uvars in the body
+-- that can be filled in.
 fillInArg :: Inferring -> Inferring -> TcM Inferring
 fillInArg filler (Expr (Pi x _ b ::: _)) = withBinding x.id (Term filler) $ normalize b
-fillInArg filler (Expr (Lam x b ::: _)) = withBinding x.id (Term filler) $ normalize b
 fillInArg _ e = do
   raise $ Bug $ "fillInArg called with non-Pi/Lam expression: " <> T.pack (show e)
   pure e
@@ -806,7 +784,7 @@ step @p = \case
         case f' of
           Expr (extract -> Lam i rhs) -> do
             tellHasReduced
-            step $ substVar i.id x' rhs -- TODO use withBinding here?
+            withBinding i.id (Term x') $ step rhs
           _ -> pure . withType $ App f' x'
       Pi x a b -> do
         a' <- step a
