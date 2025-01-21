@@ -234,7 +234,7 @@ data Error
   | NoTypeForUVar UVar
   | NoLevelForUVar UVar
   | HasNonsense Parsed
-  | StillHasUnifs UVar
+  | StillHasUnifs { expr :: Inferring, uvar :: UVar }
   | Bug Text -- ^ Unexpected error indicating a compiler bug
   deriving Show
 
@@ -338,18 +338,6 @@ normalize = \case
       Bottom -> pure Bottom
       Top -> pure Top
       TT -> pure TT
-
-
--- instance Normalize u => Normalize (Typed PInferring u) where
---   normalize :: Typed PInferring u -> TcM (Typed PInferring u)
---   normalize (t ::: k) = do
---     t' <- normalize t
---     k' <- normalize k
---     pure (t' ::: k')
-
--- instance Normalize Inferring where
---   -- | Normalize all UVars in a type
---   -- TODO maybe zonk here - although I'm not sure it makes much sense because we don't always keep this result
 
 class Unify a where
   -- | Intended argument order: Expected, then actual
@@ -530,26 +518,29 @@ rename :: (Rename a, Zonk a) => Id -> Id -> a -> TcM a
 rename orig new = zonk >=> rename' orig new
 
 toChecked :: Inferring -> MaybeT TcM Checked
-toChecked = lift . zonk >=> \case
-  Univ n -> pure $ Univ n
-  Expr (e ::: t) -> do
-    t' <- toChecked t
-    e' <- case e of
-      Nonsense p -> do
-        lift . raise $ HasNonsense p
-        hoistMaybe Nothing
-      Var a -> pure $ Var a
-      App f x -> App <$> toChecked f <*> toChecked x
-      Pi (Id x) a b -> Pi (Id x) <$> toChecked a <*> toChecked b
-      Lam (Id x) b -> Lam (Id x) <$> toChecked b
+toChecked source = toChecked' source
+  where
+    toChecked' :: Inferring -> MaybeT TcM Checked
+    toChecked' = lift . zonk >=> \case
+      Univ n -> pure $ Univ n
+      Expr (e ::: t) -> do
+        t' <- toChecked' t
+        e' <- case e of
+          Nonsense p -> do
+            lift . raise $ HasNonsense p
+            hoistMaybe Nothing
+          Var a -> pure $ Var a
+          App f x -> App <$> toChecked' f <*> toChecked' x
+          Pi (Id x) a b -> Pi (Id x) <$> toChecked' a <*> toChecked' b
+          Lam (Id x) b -> Lam (Id x) <$> toChecked' b
 
-      Bottom -> pure Bottom
-      Top -> pure Top
-      TT -> pure TT
-    pure $ Expr (e' ::: t')
-  UV u -> do
-    lift . raise $ StillHasUnifs u
-    hoistMaybe Nothing
+          Bottom -> pure Bottom
+          Top -> pure Top
+          TT -> pure TT
+        pure $ Expr (e' ::: t')
+      UV u -> do
+        lift . raise $ StillHasUnifs source u
+        hoistMaybe Nothing
 
 extractDecls :: Module PChecked -> Map Id (TypeOrTerm Checked)
 extractDecls (Module decls _) = M.fromList $ map (\(Decl name _ term) -> (name, Term term)) decls
