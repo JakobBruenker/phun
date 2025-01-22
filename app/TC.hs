@@ -152,6 +152,8 @@ instance Show Id where
 
 data Pass = PParsed | PInferring | PChecked
 
+-- | Expression that we don't give a type to, either because they don't have one
+-- or because it's determined in some other way
 type UExpr :: (Type -> Type) -> Pass -> Type
 data UExpr f p where
   Univ :: Natural -> UExpr f p
@@ -312,19 +314,21 @@ lookupVarTerm i = lookupVar i <&> \case
 
 -- | Replace any UVars and Vars with their most concrete representation
 normalize :: Inferring -> TcM Inferring
-normalize = \case
-  Univ n -> pure (Univ n)
-  Expr (Var i ::: t) -> do
-    lookupVar i >>= \case
-      Just (Term e') -> normalize e'
-      _ -> do
-        t' <- normalize t
-        pure $ Expr (Var i ::: t')
-  Expr (e ::: t) -> do
-    e' <- normalizeExpr e
-    t' <- normalize t
-    pure $ Expr (e' ::: t')
-  UV v -> normalizeUVar v
+normalize foo = do
+  res <- case foo of
+    Univ n -> pure (Univ n)
+    Expr (Var i ::: t) -> do
+      lookupVar i >>= \case
+        Just (Term e') -> normalize e'
+        _ -> do
+          t' <- normalize t
+          pure $ Expr (Var i ::: t')
+    Expr (e ::: t) -> do
+      e' <- normalizeExpr e
+      t' <- normalize t
+      pure $ Expr (e' ::: t')
+    UV v -> normalizeUVar v
+  pure res
   where
     normalizeExpr :: InferringExpr -> TcM InferringExpr
     normalizeExpr = \case
@@ -518,28 +522,30 @@ rename :: (Rename a, Zonk a) => Id -> Id -> a -> TcM a
 rename orig new = zonk >=> rename' orig new
 
 toChecked :: Inferring -> MaybeT TcM Checked
-toChecked source = toChecked' source
+toChecked source = do
+  normalized <- lift $ normalize source
+  toChecked' normalized normalized
   where
-    toChecked' :: Inferring -> MaybeT TcM Checked
-    toChecked' = lift . zonk >=> \case
+    toChecked' :: Inferring -> Inferring -> MaybeT TcM Checked
+    toChecked' context = \case
       Univ n -> pure $ Univ n
       Expr (e ::: t) -> do
-        t' <- toChecked' t
+        t' <- toChecked' context t
         e' <- case e of
           Nonsense p -> do
             lift . raise $ HasNonsense p
             hoistMaybe Nothing
           Var a -> pure $ Var a
-          App f x -> App <$> toChecked' f <*> toChecked' x
-          Pi (Id x) a b -> Pi (Id x) <$> toChecked' a <*> toChecked' b
-          Lam (Id x) b -> Lam (Id x) <$> toChecked' b
+          App f x -> App <$> toChecked' context f <*> toChecked' context x
+          Pi (Id x) a b -> Pi (Id x) <$> toChecked' context a <*> toChecked' context b
+          Lam (Id x) b -> Lam (Id x) <$> toChecked' context b
 
           Bottom -> pure Bottom
           Top -> pure Top
           TT -> pure TT
         pure $ Expr (e' ::: t')
       UV u -> do
-        lift . raise $ StillHasUnifs source u
+        lift . raise $ StillHasUnifs context u
         hoistMaybe Nothing
 
 extractDecls :: Module PChecked -> Map Id (TypeOrTerm Checked)
@@ -620,6 +626,13 @@ check expected expr = case expr of
       case NE.nonEmpty errs of
         Nothing -> do
           rhs' <- withBinding x (Type a) $ check b rhs
+          -- If k is a uvar, e.g. because it was a hole, we can fill it by inferring the kind
+          normalize k >>= \case
+            UV u -> do
+              rhsTy <- typeOf rhs'
+              lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel rhsTy)
+              substUVar u (Univ lvl)
+            _ -> pure ()
           pure $ Expr (Lam (Id x) rhs' ::: ty)
         Just es -> do
           raise $ TypeMismatch expr expected (Expr (Pi (Id x) a b ::: k)) es
@@ -682,21 +695,21 @@ infer expr = case expr of
       b' <- withBinding x (Type a') $ infer b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       pure (Expr $ Pi (Id x) a' b' ::: Univ lvl)
-    Lam x' b -> do
+    Lam x' rhs -> do
       x <- case x' of
         Id i -> pure i
         Wildcard -> Uniq <$> freshUnique Nothing
       aUV <- freshUVar
       let a = UV aUV
-      b' <- withBinding x (Type a) $ infer b
-      bt <- typeOf b'
-      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel bt)
+      rhs' <- withBinding x (Type a) $ infer rhs
+      rhsTy <- typeOf rhs'
+      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel rhsTy)
       -- TODO Q: If we later substitute x in bt, does that mean inference has to be able to use x in bt? Maybe not, if we say dependent types can't be inferred
       -- TODO do we need this to be able to infer a type for e.g. \x.x?
       -- TODO idea for that: Wrap infer lambda with something that checks if the bound var is not subst'd, and then make a Pi if so
       -- TODO except it doesn't quite work like that, because we have no inferred arguments. So \x.x cannot be generalized. What about \t.\x.the t x?
       -- TODO we could decide to default to Type in a case like \x.x
-      pure (Expr $ Lam (Id x) b' ::: Expr (Pi (Id x) a bt ::: Univ lvl))
+      pure (Expr $ Lam (Id x) rhs' ::: Expr (Pi (Id x) a rhsTy ::: Univ lvl))
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)
     Top -> pure (Expr $ Top ::: Univ 0)
