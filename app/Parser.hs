@@ -45,7 +45,7 @@ pExprNoAppOrVar = choice
 
 pVarOrUnivOrHole :: Parser Parsed
 pVarOrUnivOrHole = identifier <&> \case
-  IVar x -> Expr . Identity . Var $ Name x
+  IVar x -> Var $ Name x
   IUniv n -> Univ n
   IHole -> Hole
 
