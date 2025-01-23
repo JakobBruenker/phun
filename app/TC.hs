@@ -75,7 +75,7 @@ instance Comonad (Typed p) where
   duplicate (e ::: t) = ((e ::: t) ::: t)
 
 instance Show e => Show (Typed p e) where
-  show (e ::: t) = show e ++ " : " ++ show t
+  show (e ::: _) = show e
 
 instance {-# OVERLAPPING #-} Show (Expr f p) => Show (Identity (Expr f p)) where
   show (Identity e) = show e
@@ -669,8 +669,10 @@ check expected expr = case expr of
     Pi x' a b -> do
       x <- idOrWildcardUnique x'
       a' <- infer a
-      b' <- withBinding x (Type a') $ infer $ renameIdOrWildcard x' x b
-      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
+      let withX :: TcM a -> TcM a
+          withX = withBinding x (Type a')
+      b' <- withX . infer $ renameIdOrWildcard x' x b
+      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> withX (inferLevel b'))
       (ty, errs) <- unify expected (Univ lvl)
       case NE.nonEmpty errs of
         Nothing -> pure $ Expr (Pi (Id' x) a' b' ::: ty)
@@ -686,17 +688,18 @@ check expected expr = case expr of
       let x'' = getPiVar ty
       case NE.nonEmpty errs of
         Nothing -> do
-          rhs' <- withBinding (getPiVar ty) (Type a) $ check b $ renameIdOrWildcard x' x'' rhs
+          let withX'' = withBinding x'' (Type a)
+          rhs' <- withX'' $ check b $ renameIdOrWildcard x' x'' rhs
           -- If k is a uvar, e.g. because it was a hole, we can fill it by inferring the kind
           normalize k >>= \case
             UV u -> do
-              rhsTy <- typeOf rhs'
+              rhsTy <- withX'' $ typeOf rhs'
               lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel rhsTy)
               substUVar u (Term $ Univ lvl)
             _ -> pure ()
-          pure $ Expr (Lam (Id' x) rhs' ::: ty)
+          pure $ Expr (Lam (Id' x'') rhs' ::: ty)
         Just es -> do
-          raise $ TypeMismatch (Just expr) expected (Expr (Pi (Id' x) a b ::: k)) es
+          raise $ TypeMismatch (Just expr) expected (Expr (Pi (Id' x'') a b ::: k)) es
           pure $ Expr (Nonsense expr ::: ty)
 
     Id a b -> do
@@ -803,14 +806,17 @@ infer expr = case expr of
     Pi x' a b -> do
       x <- idOrWildcardUnique x'
       a' <- infer a
-      b' <- withBinding x (Type a') $ infer $ renameIdOrWildcard x' x b
-      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
+      let withX :: TcM a -> TcM a
+          withX = withBinding x (Type a')
+      b' <- withX . infer $ renameIdOrWildcard x' x b
+      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> withX (inferLevel b'))
       pure (Expr $ Pi (Id' x) a' b' ::: Univ lvl)
     Lam x' rhs -> do
       x <- idOrWildcardUnique x'
       a <- UV <$> freshUVar
-      rhs' <- withBinding x (Type a) $ infer $ renameIdOrWildcard x' x rhs
-      rhsTy <- typeOf rhs'
+      let withX = withBinding x (Type a)
+      rhs' <- withX $ infer $ renameIdOrWildcard x' x rhs
+      rhsTy <- withX $ typeOf rhs'
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel rhsTy)
       -- TODO Q: If we later substitute x in bt, does that mean inference has to be able to use x in bt? Maybe not, if we say dependent types can't be inferred
       -- TODO do we need this to be able to infer a type for e.g. \x.x?
