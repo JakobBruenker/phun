@@ -41,6 +41,9 @@ pExprNoAppOrVar :: Parser ParsedExpr
 pExprNoAppOrVar = choice
   [ pPi
   , pLam
+  , pId
+  , pRefl
+  , pJ
   ]
 
 pVarOrUnivOrHole :: Parser Parsed
@@ -105,6 +108,32 @@ pLam = do
   _ <- parseToken TDot
   rhs <- pUExpr
   pure $ Lam (maybe Wildcard (Id' . Name) x) rhs
+
+pId :: Parser ParsedExpr
+pId = do
+  _ <- parseToken TId
+  parens do
+    x <- pUExpr
+    _ <- parseToken TComma
+    y <- pUExpr
+    pure $ Id x y
+
+pRefl :: Parser ParsedExpr
+pRefl = do
+  _ <- parseToken TRefl
+  a <- parens pUExpr
+  pure $ Refl a
+
+pJ :: Parser ParsedExpr
+pJ = do
+  _ <- parseToken TJ
+  parens do
+    c <- pUExpr
+    _ <- parseToken TComma
+    t <- pUExpr
+    _ <- parseToken TComma
+    p <- pUExpr
+    pure $ J c t p
 
 pDecl :: Parser (Decl PParsed)
 pDecl = do

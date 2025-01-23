@@ -14,8 +14,12 @@ data Token
   | TIdent Text
   | TPi
   | TLambda
+  | TId
+  | TRefl
+  | TJ
   | TColon
   | TDot
+  | TComma
   | SOL -- start of line
   deriving (Eq, Ord)
 
@@ -26,8 +30,12 @@ instance Show Token where
     TIdent t -> T.unpack t
     TPi -> "Pi"
     TLambda -> "\\"
+    TId -> "Id"
+    TRefl -> "Refl"
+    TJ -> "J"
     TColon -> ":"
     TDot -> "."
+    TComma -> ","
     SOL -> "\n<SOL>"
 
 instance VisualStream [Token] where
@@ -58,8 +66,12 @@ lexLine t = (toList mSol <>) <$> go t
       (T.stripPrefix "∏" -> Just rest) -> TPi <:> go rest
       (T.stripPrefix "\\" -> Just rest) -> TLambda <:> go rest
       (T.stripPrefix "λ" -> Just rest) -> TLambda <:> go rest
+      (T.stripPrefix "Id" -> Just rest) -> TId <:> go rest
+      (T.stripPrefix "Refl" -> Just rest) -> TRefl <:> go rest
+      (T.stripPrefix "J" -> Just rest) -> TJ <:> go rest
       (T.stripPrefix ":" -> Just rest) -> TColon <:> go rest
       (T.stripPrefix "." -> Just rest) -> TDot <:> go rest
+      (T.stripPrefix "," -> Just rest) -> TComma <:> go rest
       _ | let (ident, rest) = T.span (\c -> isAlphaNum c || T.elem c "?_'" ) t', T.length ident > 0 -> TIdent ident <:> go rest
         | otherwise -> Left $ UnexpectedToken t'
 
