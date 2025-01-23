@@ -708,7 +708,10 @@ check expected expr = case expr of
     Bottom -> Expr . (Bottom :::) <$> tryUnif (Univ 0)
     Top -> Expr . (Top :::) <$> tryUnif (Univ 0)
     TT -> Expr . (TT :::) <$> tryUnif (Expr (Top ::: Univ 0))
-  Hole -> UV <$> freshUVar -- XXX Is this right? It seems like we ignore the expected type. But maybe this will just always result in an unsolved uvar, which might be fine. Otherwise, possibly UVars need to be able to optionally have types. Or a substType that's queried if there is no substTerm for that uvar
+  Hole -> do -- We could try automatically inferring a value here, e.g. if the type is Id(a, a), we could fill in Refl(a)
+    hole <- freshUVar
+    substUVar hole (Type expected)
+    pure $ UV hole
   where
     tryUnif = tryUnify (Just expr) expected
   
