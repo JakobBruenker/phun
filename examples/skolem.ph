@@ -1,0 +1,2 @@
+-- foo :: (forall r. (forall a. a -> r) -> r) -> _
+-- foo f = f \x -> x

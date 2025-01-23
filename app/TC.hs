@@ -36,6 +36,7 @@ import Data.Maybe (isJust)
 import GHC.Records (HasField (..))
 import Data.List qualified as L
 import Control.Applicative ((<|>))
+import GHC.Stack (HasCallStack)
 
 -- TODO if a function is used in different places, do we have to make sure to use different uvars so it's actually generalized? Test by using id at different types.
 -- TODO This is probably only an issue if uvars remain in the declaration after inference, which maybe shouldn't be allowed to begin with
@@ -205,6 +206,16 @@ instance NotParsed p => HasField "id" (IdOrWildcard p) Id where
     Id' i -> i
     Wildcard -> absurd $ notParsed E.Refl
 
+getId :: IdOrWildcard p -> Maybe Id
+getId = \case
+  Id' i -> Just i
+  Wildcard -> Nothing
+
+idOrWildcardUnique :: IdOrWildcard PParsed -> TcM Id
+idOrWildcardUnique i = Uniq <$> freshUnique case i of
+  Id' i' -> userName i'
+  Wildcard -> Nothing
+
 instance Show (f (Expr f p)) => Show (Expr f p) where
   show = \case
     Nonsense e -> show e
@@ -244,7 +255,6 @@ data Error
   | HasNonsense Parsed
   | Occurs UVar Inferring
   | StillHasUnifs { expr :: Inferring, uvar :: UVar }
-  | Impossible Text -- ^ Unexpected error indicating a compiler bug
   deriving Show
 
 -- TODO add details
@@ -411,6 +421,17 @@ instance Unify InferringExpr where
       b'' <- join $ unify' <$> lift (rename x.id uniq b) <*> lift (rename x'.id uniq b')
       pure $ Lam (Id' uniq) b''
 
+    (Id a b) (Id a' b') -> do
+      a'' <- unify' a a'
+      b'' <- unify' b b'
+      pure $ Id a'' b''
+    (Refl a) (Refl a') -> Refl <$> unify' a a'
+    (J c t p) (J c' t' p') -> do
+      c'' <- unify' c c'
+      t'' <- unify' t t'
+      p'' <- unify' p p'
+      pure $ J c'' t'' p''
+
     Bottom Bottom -> pure Bottom
     Top Top -> pure Top
     TT TT -> pure TT
@@ -511,40 +532,49 @@ freshUnique name = do
   modify' \s -> s{nextUnique = u + 1}
   pure $ Unique u name
 
+renameIdOrWildcard :: IdOrWildcard PParsed -> Id -> Parsed -> Parsed
+renameIdOrWildcard orig new e = maybe e (\v -> rename' v new e) (getId orig)
+
 class Rename a where
-  rename' :: Id -> Id -> a -> TcM a
+  rename' :: Id -> Id -> a -> a
 
-instance Rename InferringExpr where
+instance Rename (UExpr f p) => Rename (Expr f p) where
   rename' orig new = \case
-    Nonsense e -> pure (Nonsense e)
+    Nonsense e -> Nonsense e
 
-    App f x -> App <$> rename' orig new f <*> rename' orig new x
-    Pi i t b -> Pi i <$> rename' orig new t <*> if i.id == orig then pure b else rename' orig new b
-    Lam i b -> Lam i <$> if i.id == orig then pure b else rename' orig new b
+    App f x -> App (rename' orig new f) (rename' orig new x)
+    Pi i t b -> Pi i (rename' orig new t) (if matchesOrig i then b else rename' orig new b)
+    Lam i b -> Lam i (if matchesOrig i then b else rename' orig new b)
 
-    Id a b -> Id <$> rename' orig new a <*> rename' orig new b
-    Refl a -> Refl <$> rename' orig new a
-    J c t p -> J <$> rename' orig new c <*> rename' orig new t <*> rename' orig new p
+    Id a b -> Id (rename' orig new a) (rename' orig new b)
+    Refl a -> Refl (rename' orig new a)
+    J c t p -> J (rename' orig new c) (rename' orig new t) (rename' orig new p)
 
-    Bottom -> pure Bottom
-    Top -> pure Top
-    TT -> pure TT
+    Bottom -> Bottom
+    Top -> Top
+    TT -> TT
+    where
+      matchesOrig = any (orig ==) . getId
+
+instance Rename u => Rename (Identity u) where
+  rename' orig new = Identity . rename' orig new . runIdentity
 
 instance Rename u => Rename (Typed PInferring u) where
-  rename' orig new (t ::: k) = (:::) <$> rename' orig new t <*> rename' orig new k
+  rename' orig new (t ::: k) = rename' orig new t ::: rename' orig new k
 
-instance Rename Inferring where
+instance Rename (f (Expr f p)) => Rename (UExpr f p) where
   rename' orig new = \case
-    Univ n -> pure (Univ n)
-    Var a -> pure (Var (if a == orig then new else a))
-    Expr e -> Expr <$> rename' orig new e
-    UV u -> pure (UV u)
+    Univ n -> (Univ n)
+    Var a -> (Var (if a == orig then new else a))
+    Expr e -> Expr (rename' orig new e)
+    UV u -> (UV u)
+    Hole -> Hole
 
 -- | Renames all occurrences of a variable in an expression, zonking first to make sure
 -- that if the name occurs in a UVar, we can change it without having to change
 -- the global UVar mapping (Not 100% sure this is necessary)
 rename :: Id -> Id -> Inferring -> TcM Inferring
-rename orig new = normalize >=> rename' orig new
+rename orig new = fmap (rename' orig new) . normalize
 
 toChecked :: Inferring -> MaybeT TcM Checked
 toChecked source = do
@@ -608,6 +638,7 @@ checkModule mod' = do
     checkDecl (Decl name () term) = Decl name () <$> toChecked term
 
 -- | Check takes a type and a parsed expression that is expected to have that type
+-- NB: `join $ typeOf <$> check ty term` is guaranteed to be unifiable with ty
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   Univ n -> do
@@ -619,9 +650,12 @@ check expected expr = case expr of
         raise $ TypeMismatch (Just expr) expected uType es
         pure $ Expr (Nonsense expr ::: ty)
   Var a -> do
-    varType <- lookupVarType a
-    _ <- tryUnif varType
-    pure $ Var a
+    (_, null . dListToList -> success) <- RWS.listen do
+      varType <- lookupVarType a
+      tryUnif varType
+    pure if success
+      then Var a
+      else Expr (Nonsense expr ::: expected)
   Expr (Identity e) -> case e of
     App f x -> do
       i <- Uniq <$> freshUnique Nothing
@@ -633,11 +667,9 @@ check expected expr = case expr of
       b' <- tryUnify (Just f) expected =<< fillInArg x' =<< typeOf f'
       pure (Expr $ App f' x' ::: b')
     Pi x' a b -> do
-      x <- case x' of
-        Id' i -> pure i
-        Wildcard -> Uniq <$> freshUnique Nothing
+      x <- idOrWildcardUnique x'
       a' <- infer a
-      b' <- withBinding x (Type a') $ infer b
+      b' <- withBinding x (Type a') $ infer $ renameIdOrWildcard x' x b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       (ty, errs) <- unify expected (Univ lvl)
       case NE.nonEmpty errs of
@@ -646,16 +678,15 @@ check expected expr = case expr of
           raise $ TypeMismatch (Just expr) expected (Univ lvl) es
           pure $ Expr (Nonsense expr ::: ty)
     Lam x' rhs -> do
-      x <- case x' of
-        Id' i -> pure i
-        Wildcard -> Uniq <$> freshUnique Nothing
+      x <- idOrWildcardUnique x'
       a <- UV <$> freshUVar
       b <- UV <$> freshUVar
       k <- UV <$> freshUVar
       (ty, errs) <- unify expected $ Expr (Pi (Id' x) a b ::: k)
+      let x'' = getPiVar ty
       case NE.nonEmpty errs of
         Nothing -> do
-          rhs' <- withBinding x (Type a) $ check b rhs
+          rhs' <- withBinding (getPiVar ty) (Type a) $ check b $ renameIdOrWildcard x' x'' rhs
           -- If k is a uvar, e.g. because it was a hole, we can fill it by inferring the kind
           normalize k >>= \case
             UV u -> do
@@ -670,7 +701,7 @@ check expected expr = case expr of
 
     Id a b -> do
       a' <- infer a
-      a'Ty <- typeOf a'
+      a'Ty <- normalize =<< typeOf a' -- XXX normalize is for debugging
       b' <- check a'Ty b
       lvl <- maybe 0 (+1) <$> inferLevel a'Ty
       ty <- tryUnif (Univ lvl)
@@ -741,15 +772,18 @@ inferLevel = \case
   where
     inferLowerLevel t = runMaybeT [ l - 1 | l <- MaybeT (inferLevel t), l > 0 ]
 
--- | fills in the argument of a Pi type if the given expression is one,
--- returning the body. For other expressions, returns the expression unchanged,
--- but raises an error. Also fills in any other variables and uvars in the body
--- that can be filled in.
-fillInArg :: Inferring -> Inferring -> TcM Inferring
-fillInArg filler (Expr (Pi x _ b ::: _)) = withBinding x.id (Term filler) $ normalize b
-fillInArg _ e = do
-  raise $ Impossible $ "fillInArg called with non-Pi expression: " <> T.pack (show e)
-  pure e
+-- | Must be called with an expression that is a Pi type. Fills in the argument
+-- of that Pi type with the given expression, and returns the body.
+fillInArg :: HasCallStack => Inferring -> Inferring -> TcM Inferring
+fillInArg filler = \case 
+  (Expr (Pi x _ b ::: _)) -> withBinding x.id (Term filler) $ normalize b
+  e -> error $ "fillInArg called with non-Pi expression: " <> show e
+
+-- | Must be called with an expression that is a Pi type. Returns the name of the bound variable.
+getPiVar :: Inferring -> Id
+getPiVar = \case
+  (Expr (Pi x _ _ ::: _)) -> x.id
+  e -> error $ "getPiVar called with non-Pi expression: " <> show e
 
 -- infer should not use unify, and instead call check.
 infer :: Parsed -> TcM Inferring
@@ -767,19 +801,15 @@ infer expr = case expr of
       b' <- fillInArg x' =<< typeOf f'
       pure (Expr $ App f' x' ::: b')
     Pi x' a b -> do
-      x <- case x' of
-        Id' i -> pure i
-        Wildcard -> Uniq <$> freshUnique Nothing
+      x <- idOrWildcardUnique x'
       a' <- infer a
-      b' <- withBinding x (Type a') $ infer b
+      b' <- withBinding x (Type a') $ infer $ renameIdOrWildcard x' x b
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> inferLevel b')
       pure (Expr $ Pi (Id' x) a' b' ::: Univ lvl)
     Lam x' rhs -> do
-      x <- case x' of
-        Id' i -> pure i
-        Wildcard -> Uniq <$> freshUnique Nothing
+      x <- idOrWildcardUnique x'
       a <- UV <$> freshUVar
-      rhs' <- withBinding x (Type a) $ infer rhs
+      rhs' <- withBinding x (Type a) $ infer $ renameIdOrWildcard x' x rhs
       rhsTy <- typeOf rhs'
       lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel rhsTy)
       -- TODO Q: If we later substitute x in bt, does that mean inference has to be able to use x in bt? Maybe not, if we say dependent types can't be inferred
