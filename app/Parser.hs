@@ -96,7 +96,7 @@ pPi = do
   a <- pUExpr
   _ <- parseToken TDot
   b <- pUExpr
-  pure $ Pi (maybe Wildcard (Id . Name) x) a b
+  pure $ Pi (maybe Wildcard (Id' . Name) x) a b
 
 pLam :: Parser ParsedExpr
 pLam = do
@@ -104,7 +104,7 @@ pLam = do
   x <- pat
   _ <- parseToken TDot
   rhs <- pUExpr
-  pure $ Lam (maybe Wildcard (Id . Name) x) rhs
+  pure $ Lam (maybe Wildcard (Id' . Name) x) rhs
 
 pDecl :: Parser (Decl PParsed)
 pDecl = do

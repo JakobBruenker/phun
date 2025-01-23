@@ -60,7 +60,7 @@ lexLine t = (toList mSol <>) <$> go t
       (T.stripPrefix "λ" -> Just rest) -> TLambda <:> go rest
       (T.stripPrefix ":" -> Just rest) -> TColon <:> go rest
       (T.stripPrefix "." -> Just rest) -> TDot <:> go rest
-      _ | let (ident, rest) = T.span (\c -> isAlphaNum c || T.elem c ",?_'" ) t', T.length ident > 0 -> TIdent ident <:> go rest
+      _ | let (ident, rest) = T.span (\c -> isAlphaNum c || T.elem c "?_'" ) t', T.length ident > 0 -> TIdent ident <:> go rest
         | otherwise -> Left $ UnexpectedToken t'
 
 lexFile :: Text -> Either LexerError [Token]

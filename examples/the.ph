@@ -3,7 +3,7 @@ the : ΠX:Type4.Πx:X.X
 
 -- test comment
 
-foo : _ -- Why does this only work without the type annotation?
+foo : _
 λt.λx.the t x
 
 the _ Type2
