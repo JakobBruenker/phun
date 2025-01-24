@@ -639,6 +639,8 @@ checkModule mod' = do
 
 -- | Check takes a type and a parsed expression that is expected to have that type
 -- NB: `join $ typeOf <$> check ty term` is guaranteed to be unifiable with ty
+-- TODO: We always return the unified type here instead of expected. Could that be an issue if the unified type has a different variable than expected? And that variable is currently in context?
+-- TODO: I think the main reason for using the unification result is that it's already normalized and evaluated, and we don't want to repeat that work later
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   Univ n -> do
@@ -710,15 +712,16 @@ check expected expr = case expr of
       ty <- tryUnif (Univ lvl)
       pure (Expr $ Id a' b' ::: ty)
     Refl a -> do
-      aTy <- UV <$> freshUVar
+      a' <- UV <$> freshUVar
       u <- UV <$> freshUVar
-      (ty, errs) <- unify expected (Expr (Id aTy aTy ::: u))
+      (ty, errs) <- unify expected (Expr (Id a' a' ::: u))
+      aTy <- typeOf a'
+      a'' <- tryUnify (Just a) a' =<< check aTy a
       case NE.nonEmpty errs of
         Nothing -> do
-          a' <- check aTy a
-          pure (Expr $ Refl a' ::: ty)
+          pure (Expr $ Refl a'' ::: ty)
         Just es -> do
-          raise $ TypeMismatch (Just expr) expected (Expr (Id aTy aTy ::: u)) es
+          raise $ TypeMismatch (Just expr) expected (Expr (Id a' a'' ::: u)) es
           pure (Expr $ Nonsense expr ::: ty)
     J c t p -> do
       x <- UV <$> freshUVar
@@ -735,9 +738,9 @@ check expected expr = case expr of
         ty' <- UV <$> freshUVar
         check (Expr (Pi xVar a (Expr (App c' (Expr (Refl (Var xVar.id) ::: idTy)) ::: ty)) ::: ty')) t
       p' <- check idTy p
-      b' <- fillInArg p' =<< typeOf c'
-      ty' <- tryUnif b'
-      pure $ Expr $ J c' t' p' ::: (Expr $ App c' p' ::: ty')
+      k <- UV <$> freshUVar
+      ty' <- tryUnif (Expr (App c' p' ::: k))
+      pure $ Expr $ J c' t' p' ::: ty'
 
     Bottom -> Expr . (Bottom :::) <$> tryUnif (Univ 0)
     Top -> Expr . (Top :::) <$> tryUnif (Univ 0)
@@ -752,7 +755,7 @@ check expected expr = case expr of
 tryUnify :: Maybe Parsed -> Inferring -> Inferring -> TcM Inferring
 tryUnify expr expt act = do
   (expr', errs) <- unify expt act
-  traverse_ (raise . TypeMismatch expr expt act) (NE.nonEmpty errs) $> expr'
+  traverse_ (\x -> raise (TypeMismatch expr expt act x)) (NE.nonEmpty errs) $> expr'
 
 unifiable :: Inferring -> Inferring -> TcM Bool
 unifiable e e' = do
@@ -832,10 +835,9 @@ infer expr = case expr of
       lvl <- maybe 0 (+1) <$> inferLevel a'Ty
       pure (Expr $ Id a' b' ::: Univ lvl)
     Refl a -> do
+      ty <- infer (Expr (Identity (Id a a)))
       a' <- infer a
-      a'Ty <- typeOf a'
-      lvl <- maybe 0 (+1) <$> inferLevel a'Ty
-      pure (Expr $ Refl a' ::: Expr (Id a'Ty a'Ty ::: Univ lvl))
+      pure (Expr $ Refl a' ::: ty)
     J c t p -> do
       x <- UV <$> freshUVar
       y <- UV <$> freshUVar
