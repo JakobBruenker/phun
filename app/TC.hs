@@ -161,7 +161,7 @@ data UExpr f p where
 instance Show (f (Expr f p)) => Show (UExpr f p) where
   show = \case
     Univ n -> "Type" ++ if n > 0 then showNaturalSubscript n else ""
-    Expr e -> "(" ++ show e ++ ")"
+    Expr e -> show e
     Var i -> show i
     UV u -> show u
     Hole -> "?"
@@ -216,17 +216,22 @@ idOrWildcardUnique i = Uniq <$> freshUnique case i of
   Id' i' -> userName i'
   Wildcard -> Nothing
 
-instance Show (f (Expr f p)) => Show (Expr f p) where
+instance (Show (f (Expr f p)), Comonad f) => Show (Expr f p) where
   show = \case
     Nonsense e -> show e
 
-    App f x -> "(" ++ show f ++ " " ++ show x ++ ")"
+    (App f x) -> "(" ++ unwords (show <$> getApps [x] f) ++ ")"
+      where
+        getApps :: [UExpr f p] -> UExpr f p -> [UExpr f p]
+        getApps acc = \case
+          (Expr (extract -> App f' x')) -> getApps (x':acc) f'
+          e -> e:acc
     Pi i t b -> sPi ++ " " ++ show i ++ " : " ++ show t ++ " . " ++ show b
     Lam i b -> sLam ++ " " ++ show i ++ " . " ++ show b
 
     Id a b -> constr "Id" [a, b]
-    Refl a -> constr "Refl " [a]
-    J c t p -> constr "J " [c, t, p]
+    Refl a -> constr "Refl" [a]
+    J c t p -> constr "J" [c, t, p]
 
     Bottom -> sBot
     Top -> sTop
@@ -254,7 +259,7 @@ data Error
   | NoLevelForUVar UVar
   | HasNonsense Parsed
   | Occurs UVar Inferring
-  | StillHasUnifs { expr :: Inferring, uvar :: UVar }
+  | StillHasUnifs { expr :: Inferring, uvar :: UVar, uvarType :: Inferring }
   deriving Show
 
 -- TODO add details
@@ -606,7 +611,7 @@ toChecked source = do
               TT -> pure TT
             pure $ Expr (e' ::: ty')
           UV u -> do
-            lift . raise $ StillHasUnifs context u
+            lift $ raise . StillHasUnifs context u =<< typeOf (UV u)
             hoistMaybe Nothing
 
 extractDecls :: Module PChecked -> Map Id (TypeOrTerm Checked)
@@ -731,13 +736,13 @@ check expected expr = case expr of
       b <- UV <$> freshUVar
       idK <- UV <$> freshUVar
       let idTy = Expr (Id x y ::: idK)
+      p' <- check idTy p
       ty <- UV <$> freshUVar
       c' <- check (Expr (Pi pVar idTy b ::: ty)) c
       xVar <- Id' . Uniq <$> freshUnique Nothing
       t' <- do 
         ty' <- UV <$> freshUVar
         check (Expr (Pi xVar a (Expr (App c' (Expr (Refl (Var xVar.id) ::: idTy)) ::: ty)) ::: ty')) t
-      p' <- check idTy p
       k <- UV <$> freshUVar
       ty' <- tryUnif (Expr (App c' p' ::: k))
       pure $ Expr $ J c' t' p' ::: ty'
@@ -781,9 +786,9 @@ inferLevel = \case
 -- | Must be called with an expression that is a Pi type. Fills in the argument
 -- of that Pi type with the given expression, and returns the body.
 fillInArg :: HasCallStack => Inferring -> Inferring -> TcM Inferring
-fillInArg filler = \case 
+fillInArg filler e = normalize e >>= \case 
   (Expr (Pi x _ b ::: _)) -> withBinding x.id (Term filler) $ normalize b
-  e -> error $ "fillInArg called with non-Pi expression: " <> show e
+  e' -> error $ "fillInArg called with non-Pi expression: " <> show e'
 
 -- | Must be called with an expression that is a Pi type. Returns the name of the bound variable.
 getPiVar :: Inferring -> Id
