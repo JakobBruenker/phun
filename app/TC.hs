@@ -37,6 +37,7 @@ import GHC.Records (HasField (..))
 import Data.List qualified as L
 import Control.Applicative ((<|>))
 import GHC.Stack (HasCallStack)
+import Debug.Trace
 
 -- TODO if a function is used in different places, do we have to make sure to use different uvars so it's actually generalized? Test by using id at different types.
 -- TODO This is probably only an issue if uvars remain in the declaration after inference, which maybe shouldn't be allowed to begin with
@@ -478,7 +479,13 @@ instance Unify Inferring where
               _ u'@(Name _) -> u'
               u _ -> u
         (Expr t) (Expr t') -> Expr <$> unify' t t'
-        t t' -> raise (Can'tUnifyTypes t t') *> pure t
+        t t' -> do
+          ctx <- ask
+          traceM $ "Context: " ++ show ctx
+          traceM $ "Unifying " ++ show t ++ " with " ++ show t'
+          t'' <- lift $ eval_ t'
+          traceM $ "Normalized to " ++ show t''
+          raise (Can'tUnifyTypes t t') *> pure t
 
 substUVar :: UVar -> TypeOrTerm Inferring -> TcM ()
 substUVar v t = do
@@ -622,8 +629,7 @@ inferModule (Module declarations mainExpr) = case declarations of
   [] -> Module [] <$> traverse infer mainExpr
   decl:decls -> do
     decl'@(Decl name () term) <- inferDecl decl
-    ty <- typeOf term
-    (Module decls' mainExpr') <- withBinding name (Type ty) (inferModule (Module decls mainExpr))
+    (Module decls' mainExpr') <- withBinding name (Term term) (inferModule (Module decls mainExpr))
     pure $ Module (decl':decls') mainExpr'
     where
       inferDecl :: Decl PParsed -> TcM (Decl PInferring)
