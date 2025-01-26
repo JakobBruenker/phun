@@ -9,3 +9,6 @@ idRight : ΠA:Type.Πa:A.Πb:A.Πp:Id(a,b).A
 
 sym : ΠA:Type.Πa:A.Πb:A.Πp:Id(a,b).Id(b,a)
 \A.\a.\b.\p.J(\x.\y.\q.Id(y,x),\v.Refl(v),p)
+
+symsymPisP : ΠA:Type.Πa:A.Πb:A.Πp:Id(a,b).Id(sym (sym p), p)
+?

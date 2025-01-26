@@ -306,6 +306,9 @@ raise = tell . DList . Endo . (:)
 withBinding :: MonadReader (Vars v) m => Id -> (TypeOrTerm v) -> m a -> m a
 withBinding i t = local (M.insert i t)
 
+withoutBinding :: MonadReader (Vars v) m => Id -> m a -> m a
+withoutBinding i = local (M.delete i)
+
 withContext :: MonadReader (Vars v) m => Map Id (TypeOrTerm v) -> m a -> m a
 withContext ctx = local (M.union ctx)
 
@@ -354,8 +357,8 @@ normalizeExpr = \case
   Nonsense e -> pure (Nonsense e)
 
   App f x -> App <$> normalize f <*> normalize x
-  Pi i t b -> Pi i <$> normalize t <*> normalize b
-  Lam i b -> Lam i <$> normalize b
+  Pi i t b -> withoutBinding i.id do Pi i <$> normalize t <*> normalize b
+  Lam i b -> withoutBinding i.id do Lam i <$> normalize b
 
   Id a b -> Id <$> normalize a <*> normalize b
   Refl a -> Refl <$> normalize a
