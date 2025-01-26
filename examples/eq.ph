@@ -13,10 +13,11 @@ sym : ΠA:Type.Πa:A.Πb:A.Πp:Id(a,b).Id(b,a)
 symsymPisP : ΠA:Type.Πa:A.Πb:A.Πp:Id(a,b).Id(sym _ _ _ (sym _ _ _ p), p)
 \A.\a.\b.\p.J(\x.\y.\q.Id(sym _ _ _ (sym _ _ _ q), q),\v.Refl(Refl(v)),p)
 
--- \A.\a.\b.\p.J(\x.\y.\q.Id(sym _ _ _ (sym _ _ _ q), q),\v.Refl(_),p) -- this also works
+symsymPisP : ΠA:Type.Πa:A.Πb:A.Πp:Id(a,b).Id(sym _ _ _ (sym _ _ _ p), p)
+\A.\a.\b.\p.J(\x.\y.\q.Id(sym _ _ _ (sym _ _ _ q), q),\v.Refl(_),p) -- this also works
 
 idIsNop : ΠA:Type.Id(id(A),A)
-\_.Refl(_)
+\A.Refl(A)
 
 the : ΠX:Type1.Πx:X.X
 λt.λx.x
@@ -27,3 +28,14 @@ idIsId : ΠA:Type.Id(id, \a.a)
 idIsId : ΠA:Type.Id(id, \a.a)
 -- \A.Refl(\y.y) -- this doesn't work at the moment, but maybe should
 \A.Refl(the _ (\y.y)) -- this works
+
+-- this crashes!
+-- trans : ΠA:Type.Πa:A.Πb:A.Πc:A.Πp:Id(a,b).Πq:Id(b,c).Id(a,c)
+-- \A.\a.\b.\c.\p.J(_, \v.\x.?, p)
+
+-- this crashes!
+-- trans : ΠA:Type.Πa:A.Πb:A.Πc:A.Πp:Id(a,b).Πq:Id(b,c).Id(a,c)
+-- \A.\a.\b.\c.\p.J(\x.\y.\q.q, \v.\x.?, p)
+
+trans : ΠA:Type.Πa:A.Πb:A.Πc:A.Π_:Id(a,b).Π_:Id(b,c).Id(a,c)
+\A.\a.\b.\c.\p.J(\x.\y.\q.Π_:Id(y,c).Id(x,c), \v.\q.q, p)

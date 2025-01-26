@@ -10,7 +10,7 @@ import Control.Monad.Reader (MonadReader (..), Reader)
 import Control.Monad.RWS.CPS (RWS, tell, censor, gets, modify', asks, runRWS, MonadWriter)
 import Control.Monad.RWS qualified as RWS
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Maybe (MaybeT(..), hoistMaybe)
+import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Trans.Writer.CPS (WriterT, listen, runWriterT)
 import Data.Bifunctor (second)
 import Data.Char (chr, ord)
@@ -581,38 +581,57 @@ instance Rename (f (Expr f p)) => Rename (UExpr f p) where
 rename :: Id -> Id -> Inferring -> TcM Inferring
 rename orig new = fmap (rename' orig new) . normalize
 
-toChecked :: Maybe Text -> Inferring -> MaybeT TcM Checked
+toChecked :: Maybe Text -> Inferring -> TcM (Maybe Checked)
 toChecked declName source = do
-  reduced <- lift $ normalize source
+  reduced <- normalize source
   go reduced reduced
   where
-    go :: Inferring -> Inferring -> MaybeT TcM Checked
+    go :: Inferring -> Inferring -> TcM (Maybe Checked)
     go context = go'
       where
+        -- We use Maybe instead of MaybeT to avoid short-circuiting on Nothing, we want to collect all errors
+        go' :: Inferring -> TcM (Maybe Checked)
         go' = \case
-          Univ n -> pure $ Univ n
-          Var a -> pure $ Var a
+          Univ n -> pure . Just $ Univ n
+          Var a -> pure . Just $ Var a
           Expr (e ::: ty) -> do
             ty' <- go' ty
             e' <- case e of
               Nonsense p -> do
-                lift . raise $ HasNonsense p
-                hoistMaybe Nothing
-              App f x -> App <$> go' f <*> go' x
-              Pi (Id' x) a b -> Pi (Id' x) <$> go' a <*> go' b
-              Lam (Id' x) b -> Lam (Id' x) <$> go' b
+                raise $ HasNonsense p
+                pure Nothing
+              App f x -> do
+                f' <- go' f
+                x' <- go' x
+                pure $ App <$> f' <*> x'
+              Pi (Id' x) a b -> do
+                a' <- go' a
+                b' <- go' b
+                pure $ Pi (Id' x) <$> a' <*> b'
+              Lam (Id' x) b -> do
+                b' <- go' b
+                pure $ Lam (Id' x) <$> b'
 
-              Id a b -> Id <$> go' a <*> go' b
-              Refl a -> Refl <$> go' a
-              J c t p -> J <$> go' c <*> go' t <*> go' p
+              Id a b -> do
+                a' <- go' a
+                b' <- go' b
+                pure $ Id <$> a' <*> b'
+              Refl a -> do
+                a' <- go' a
+                pure $ Refl <$> a'
+              J c t p -> do
+                c' <- go' c
+                t' <- go' t
+                p' <- go' p
+                pure $ J <$> c' <*> t' <*> p'
 
-              Bottom -> pure Bottom
-              Top -> pure Top
-              TT -> pure TT
-            pure $ Expr (e' ::: ty')
+              Bottom -> pure $ Just Bottom
+              Top -> pure $ Just Top
+              TT -> pure $ Just TT
+            pure $ Expr <$> liftA2 (:::) e' ty'
           UV u -> do
-            lift $ raise . StillHasUnifs declName context u =<< eval_ =<< typeOf (UV u)
-            hoistMaybe Nothing
+            raise . StillHasUnifs declName context u =<< eval_ =<< typeOf (UV u)
+            pure Nothing
 
 extractDecls :: Module p -> Map Id (TypeOrTerm (PassUExpr p))
 extractDecls (Module decls _) = M.fromList $ map (\(Decl name _ term) -> (name, Term term)) decls
@@ -634,12 +653,13 @@ inferModule (Module declarations mainExpr) = case declarations of
 checkModule :: Module PParsed -> TcM (Maybe (Module PChecked))
 checkModule mod' = do
   inferred@(Module decls mainExpr) <- inferModule mod'
-  runMaybeT $ withContext (extractDecls inferred) $ Module
-    <$> traverse checkDecl decls
-    <*> traverse (toChecked Nothing) mainExpr
+  withContext (extractDecls inferred) do
+    decls' <- sequence <$> traverse checkDecl decls
+    mainExpr' <- traverse (toChecked Nothing) mainExpr
+    pure $ Module <$> decls' <*> mainExpr'
   where
-    checkDecl :: Decl PInferring -> MaybeT TcM (Decl PChecked)
-    checkDecl (Decl name () term) = Decl name () <$> toChecked (Just . T.pack $ show name) term
+    checkDecl :: Decl PInferring -> TcM (Maybe (Decl PChecked))
+    checkDecl (Decl name () term) = fmap (Decl name ()) <$> toChecked (Just . T.pack $ show name) term
 
 -- | Check takes a type and a parsed expression that is expected to have that type
 -- NB: `join $ typeOf <$> check ty term` is guaranteed to be unifiable with ty
