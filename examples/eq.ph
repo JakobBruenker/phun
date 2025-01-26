@@ -15,7 +15,9 @@ sym : ΠA:Type.Πa:A.Πb:A.Πp:Id(a,b).Id(b,a)
 -- \Aty.\a.\b.\p.J(\q.Id(?, ?),?,p)
 
 --\Aty.\a.\b.\p.J(\q.Id(idRight _ _ _ q, ?),?,p)
-\A.\a.\b.\p.J(\q.Id(idRight _ _ _ q, idLeft _ _ _ q),\p'.Refl(p'),p)
+--\A.\a.\b.\p.J(\q.Id(idRight _ _ _ q, idLeft _ _ _ q),\x.Refl(x),p)
+--\A.\a.\b.\p.J(\q.Id(idRight _ _ _ q, idLeft _ _ _ q),\x.Refl(?),p)
+\A.\a.\b.\p.J(\q.Id(idRight _ _ _ q, idLeft _ _ _ q),?,p)
 
 -- apparently this works
 --foo : ΠA:Type.Πa:A.Πp:Id(a,a).A

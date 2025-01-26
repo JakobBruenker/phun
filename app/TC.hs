@@ -260,7 +260,7 @@ data Error
   | NoLevelForUVar UVar
   | HasNonsense Parsed
   | Occurs UVar Inferring
-  | StillHasUnifs { expr :: Inferring, uvar :: UVar, uvarType :: Inferring }
+  | StillHasUnifs { declName :: Maybe Text, expr :: Inferring, uvar :: UVar, uvarType :: Inferring }
   deriving Show
 
 -- TODO add details
@@ -304,21 +304,11 @@ silence = censor $ const emptyDList
 raise :: MonadWriter (DList a) m => a -> m ()
 raise = tell . DList . Endo . (:)
 
-lookupUVar :: UVar -> TcM (Maybe (TypeOrTerm Inferring))
-lookupUVar u = IM.lookup u.id <$> gets (.subst)
-
--- | Get the most concrete representation we have for a UVar
-normalizeUVar :: UVar -> TcM Inferring
-normalizeUVar v = do
-  t <- lookupUVar v
-  case t of
-    Nothing -> pure (UV v)
-    Just (Type _) -> pure (UV v)
-    Just (Term (UV v')) -> normalizeUVar v'
-    Just (Term t') -> normalize t'
-
 withBinding :: MonadReader (Vars v) m => Id -> (TypeOrTerm v) -> m a -> m a
 withBinding i t = local (M.insert i t)
+
+withContext :: MonadReader (Vars v) m => Map Id (TypeOrTerm v) -> m a -> m a
+withContext ctx = local (M.union ctx)
 
 lookupVar :: MonadReader (Vars a) m => Id -> m (Maybe (TypeOrTerm a))
 lookupVar = asks . M.lookup
@@ -331,10 +321,18 @@ lookupVarType i = lookupVar i >>= \case
   Just (Type t) -> pure t
   Just (Term t) -> typeOf t
 
-lookupVarTerm :: MonadReader (Vars a) m => Id -> m (Maybe a)
-lookupVarTerm i = lookupVar i <&> \case
-  Just (Term t) -> Just t
-  _ -> Nothing
+lookupUVar :: UVar -> TcM (Maybe (TypeOrTerm Inferring))
+lookupUVar u = IM.lookup u.id <$> gets (.subst)
+
+-- | Get the most concrete representation we have for a UVar
+normalizeUVar :: UVar -> TcM Inferring
+normalizeUVar v = do
+  t <- lookupUVar v
+  case t of
+    Nothing -> pure (UV v)
+    Just (Type _) -> pure (UV v)
+    Just (Term (UV v')) -> normalizeUVar v'
+    Just (Term t') -> normalize t'
 
 -- TODO maybe find a better name? normalize kind of sounds like we're reducing it (like zonk...)
 -- | Replace any UVars and Vars with their most concrete representation
@@ -588,10 +586,10 @@ instance Rename (f (Expr f p)) => Rename (UExpr f p) where
 rename :: Id -> Id -> Inferring -> TcM Inferring
 rename orig new = fmap (rename' orig new) . normalize
 
-toChecked :: Inferring -> MaybeT TcM Checked
-toChecked source = do
-  normalized <- lift $ normalize source
-  go normalized normalized
+toChecked :: Maybe Text -> Inferring -> MaybeT TcM Checked
+toChecked declName source = do
+  reduced <- lift $ normalize source
+  go reduced reduced
   where
     go :: Inferring -> Inferring -> MaybeT TcM Checked
     go context = go'
@@ -618,10 +616,10 @@ toChecked source = do
               TT -> pure TT
             pure $ Expr (e' ::: ty')
           UV u -> do
-            lift $ raise . StillHasUnifs context u =<< typeOf (UV u)
+            lift $ raise . StillHasUnifs declName context u =<< eval_ =<< typeOf (UV u)
             hoistMaybe Nothing
 
-extractDecls :: Module PChecked -> Map Id (TypeOrTerm Checked)
+extractDecls :: Module p -> Map Id (TypeOrTerm (PassUExpr p))
 extractDecls (Module decls _) = M.fromList $ map (\(Decl name _ term) -> (name, Term term)) decls
 
 inferModule :: Module PParsed -> TcM (Module PInferring)
@@ -640,13 +638,13 @@ inferModule (Module declarations mainExpr) = case declarations of
 
 checkModule :: Module PParsed -> TcM (Maybe (Module PChecked))
 checkModule mod' = do
-  Module decls mainExpr <- inferModule mod'
-  runMaybeT $ Module
+  inferred@(Module decls mainExpr) <- inferModule mod'
+  runMaybeT $ withContext (extractDecls inferred) $ Module
     <$> traverse checkDecl decls
-    <*> traverse toChecked mainExpr
+    <*> traverse (toChecked Nothing) mainExpr
   where
     checkDecl :: Decl PInferring -> MaybeT TcM (Decl PChecked)
-    checkDecl (Decl name () term) = Decl name () <$> toChecked term
+    checkDecl (Decl name () term) = Decl name () <$> toChecked (Just . T.pack $ show name) term
 
 -- | Check takes a type and a parsed expression that is expected to have that type
 -- NB: `join $ typeOf <$> check ty term` is guaranteed to be unifiable with ty
@@ -717,7 +715,7 @@ check expected expr = case expr of
 
     Id a b -> do
       a' <- infer a
-      a'Ty <- normalize =<< typeOf a' -- XXX normalize is for debugging
+      a'Ty <- typeOf a'
       b' <- check a'Ty b
       lvl <- maybe 0 (+1) <$> inferLevel a'Ty
       ty <- tryUnif (Univ lvl)
@@ -953,14 +951,14 @@ step @p = \case
             withBinding i.id (Term x') $ eval rhs
           _ -> pure . withType $ App f' x'
       Pi x a b -> do
-        a' <- step a
-        b' <- step b
+        a' <- eval a
+        b' <- eval b
         pure . withType $ Pi x a' b'
       Lam x b -> withType . Lam x <$> eval b
 
       Id a b -> do
-        a' <- step a
-        b' <- step b
+        a' <- eval a
+        b' <- eval b
         pure . withType $ Id a' b'
       Refl a -> withType . Refl <$> eval a
       J c t p -> do
@@ -995,7 +993,7 @@ runTcM @a action = runRWS withNormalizedErrors M.empty (TcState 0 0 IM.empty) &
 
     normalizeError :: Error -> TcM Error
     normalizeError = \case
-      TypeMismatch e expt act errs -> TypeMismatch e <$> normalize act <*> normalize expt <*> traverse normalizeUFails errs
+      TypeMismatch e expt act errs -> TypeMismatch e <$> normalize expt <*> normalize act <*> traverse normalizeUFails errs
       e -> pure e
 
     normalizeUFails :: UnificationFailure -> TcM UnificationFailure
