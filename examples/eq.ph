@@ -39,3 +39,7 @@ idIsId : ΠA:Type.Id(id, \a.a)
 
 trans : ΠA:Type.Πa:A.Πb:A.Πc:A.Π_:Id(a,b).Π_:Id(b,c).Id(a,c)
 \A.\a.\b.\c.\p.J(\x.\y.\q.Π_:Id(y,c).Id(x,c), \v.\q.q, p)
+
+-- If you leave out x or y, it results in a type mismatch, because it automatically fills in b here, which is maybe not ideal
+-- (The error should instead be that unification variables are still left)
+-- \A.\a.\b.\c.\p.J(\x.\y.\q.Π_:Id(_,c).Id(x,c), \v.\q.q, p)

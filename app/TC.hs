@@ -38,8 +38,7 @@ import Data.List qualified as L
 import Control.Applicative ((<|>))
 import GHC.Stack (HasCallStack)
 
--- TODO if a function is used in different places, do we have to make sure to use different uvars so it's actually generalized? Test by using id at different types.
--- TODO This is probably only an issue if uvars remain in the declaration after inference, which maybe shouldn't be allowed to begin with
+-- TODO it might make more sense to infer the universe levels in a separate pass, after inference
 
 type Module :: Pass -> Type
 data Module p = Module 
@@ -179,17 +178,19 @@ data Expr f p where
   -- ^ x:A, y:A
   Refl :: UExpr f p -> Expr f p
   J :: UExpr f p -> UExpr f p -> UExpr f p -> Expr f p
-  -- ^ C:Πx.Πy.Π_:(Id x y).Type_n, t:Πx:A.C x x Refl(x), p:Id a b
+  -- ^ C:Πx.Πy.Π_:(Id x y).?, t:Πx:A.C x x Refl(x), p:Id a b
 
   -- TODO dependent sum
 
-  -- Technically, anything below can be encoded with the above
-  -- TODO either remove or add eliminators
-  -- TODO actually we might need it. Otherwise we'd have to e.g. implement natural numbers with functions - but we dont' have funext (unless we add it)
-  -- TODO although.. consider you could use Id Type Type for Unit and Id Type Type2 for Void. But what about Boolean?
   Bottom :: Expr f p
+  Absurd :: UExpr f p -> Expr f p
   Top :: Expr f p
   TT :: Expr f p
+  Bool :: Expr f p
+  True' :: Expr f p
+  False' :: Expr f p
+  If :: UExpr f p -> UExpr f p -> UExpr f p -> UExpr f p -> Expr f p
+  -- ^ motive:Πc:Bool.?, condition:Bool, ifTrue:C(True), ifFalse:C(False)
 
 type IdOrWildcard :: Pass -> Type
 data IdOrWildcard p where
@@ -234,8 +235,13 @@ instance (Show (f (Expr f p)), Comonad f) => Show (Expr f p) where
     J c t p -> constr "J" [c, t, p]
 
     Bottom -> sBot
+    Absurd a -> constr "Absurd" [a]
     Top -> sTop
-    TT -> "tt"
+    TT -> "TT"
+    Bool -> "Bool"
+    True' -> "True"
+    False' -> "False"
+    If m c a b -> constr "If" [m, c, a, b]
     where
       constr name args = name ++ "(" ++ L.intercalate ", " (map show args) ++ ")"
 #ifdef UNICODE
@@ -364,8 +370,13 @@ normalizeExpr = \case
   J c t p -> J <$> normalize c <*> normalize t <*> normalize p
 
   Bottom -> pure Bottom
+  Absurd a -> Absurd <$> normalize a
   Top -> pure Top
   TT -> pure TT
+  Bool -> pure Bool
+  True' -> pure True'
+  False' -> pure False'
+  If m c a b -> If <$> normalize m <*> normalize c <*> normalize a <*> normalize b
 
 class Unify a where
   -- | Intended argument order: Expected, then actual
@@ -396,8 +407,13 @@ hasUVars = fmap go . normalize
       Refl a -> go a
       J c t p -> go c || go t || go p
       Bottom -> False
+      Absurd a -> go a
       Top -> False
       TT -> False
+      Bool -> False
+      True' -> False
+      False' -> False
+      If m c a b -> go m || go c || go a || go b
 
 instance Unify InferringExpr where
   unify' = \cases
@@ -426,20 +442,18 @@ instance Unify InferringExpr where
       b'' <- join $ unify' <$> lift (rename x.id uniq b) <*> lift (rename x'.id uniq b')
       pure $ Lam (Id' uniq) b''
 
-    (Id a b) (Id a' b') -> do
-      a'' <- unify' a a'
-      b'' <- unify' b b'
-      pure $ Id a'' b''
+    (Id a b) (Id a' b') -> Id <$> unify' a a' <*> unify' b b'
     (Refl a) (Refl a') -> Refl <$> unify' a a'
-    (J c t p) (J c' t' p') -> do
-      c'' <- unify' c c'
-      t'' <- unify' t t'
-      p'' <- unify' p p'
-      pure $ J c'' t'' p''
+    (J c t p) (J c' t' p') -> J <$> unify' c c' <*> unify' t t' <*> unify' p p'
 
     Bottom Bottom -> pure Bottom
+    (Absurd a) (Absurd a') -> Absurd <$> unify' a a'
     Top Top -> pure Top
     TT TT -> pure TT
+    Bool Bool -> pure Bool
+    True' True' -> pure True'
+    False' False' -> pure False'
+    (If m c a b) (If m' c' a' b') -> If <$> unify' m m' <*> unify' c c' <*> unify' a a' <*> unify' b b'
     t t' -> raise (Can'tUnifyExprs t t') *> pure t
 
 instance Unify u => Unify (Typed PInferring u) where
@@ -485,7 +499,7 @@ substUVar v t = do
   let unwrapped = case t of
         Type e -> e
         Term e -> e
-  when (occurs unwrapped) do raise $ Occurs v unwrapped
+  when (occurs unwrapped) do raise $ Occurs v unwrapped -- occurs check
   lookupUVar v >>= \case
     Nothing -> pure ()
     Just (Type existingType) -> case t of
@@ -522,8 +536,13 @@ substUVar v t = do
       Refl a -> occurs a
       J c t' p -> occurs c || occurs t' || occurs p
       Bottom -> False
+      Absurd a -> occurs a
       Top -> False
       TT -> False
+      Bool -> False
+      True' -> False
+      False' -> False
+      If m c a b -> occurs m || occurs c || occurs a || occurs b
 
 freshUVar :: TcM UVar
 freshUVar = do
@@ -556,8 +575,13 @@ instance Rename (UExpr f p) => Rename (Expr f p) where
     J c t p -> J (rename' orig new c) (rename' orig new t) (rename' orig new p)
 
     Bottom -> Bottom
+    Absurd a -> Absurd (rename' orig new a)
     Top -> Top
     TT -> TT
+    Bool -> Bool
+    True' -> True'
+    False' -> False'
+    If m c a b -> If (rename' orig new m) (rename' orig new c) (rename' orig new a) (rename' orig new b)
     where
       matchesOrig = any (orig ==) . getId
 
@@ -626,8 +650,20 @@ toChecked declName source = do
                 pure $ J <$> c' <*> t' <*> p'
 
               Bottom -> pure $ Just Bottom
+              Absurd a -> do
+                a' <- go' a
+                pure $ Absurd <$> a'
               Top -> pure $ Just Top
               TT -> pure $ Just TT
+              Bool -> pure $ Just Bool
+              True' -> pure $ Just True'
+              False' -> pure $ Just False'
+              If m c a b -> do
+                m' <- go' m
+                c' <- go' c
+                a' <- go' a
+                b' <- go' b
+                pure $ If <$> m' <*> c' <*> a' <*> b'
             pure $ Expr <$> liftA2 (:::) e' ty'
           UV u -> do
             raise . StillHasUnifs declName context u =<< eval_ =<< typeOf (UV u)
@@ -783,8 +819,32 @@ check expected expr = case expr of
       pure $ Expr $ J c' t' p' ::: ty'
 
     Bottom -> Expr . (Bottom :::) <$> tryUnif (Univ 0)
+    Absurd a -> do
+      b <- infer $ Expr (Identity Bottom)
+      a' <- check b a
+      pure (Expr $ Absurd a' ::: expected)
     Top -> Expr . (Top :::) <$> tryUnif (Univ 0)
     TT -> Expr . (TT :::) <$> tryUnif (Expr (Top ::: Univ 0))
+    Bool -> Expr . (Bool :::) <$> tryUnif (Univ 0)
+    True' -> Expr . (True' :::) <$> tryUnif (Expr (Bool ::: Univ 0))
+    False' -> Expr . (False' :::) <$> tryUnif (Expr (Bool ::: Univ 0))
+    If m c a b -> do
+      rhs <- UV <$> freshUVar
+      k <- UV <$> freshUVar
+      x <- Id' . Uniq <$> freshUnique Nothing
+      bool <- infer $ Expr (Identity Bool)
+      m' <- check (Expr (Pi x bool rhs ::: k)) m
+      m'Ty <- typeOf m'
+      c' <- check bool c
+      true <- infer $ Expr (Identity True')
+      trueTy <- fillInArg true m'Ty
+      a' <- check (Expr (App m' true ::: trueTy)) a
+      false <- infer $ Expr (Identity False')
+      falseTy <- fillInArg false m'Ty
+      b' <- check (Expr (App m' false ::: falseTy)) b
+      mcTy <- fillInArg c' m'Ty
+      ty' <- tryUnif (Expr (App m' c' ::: mcTy))
+      pure (Expr $ If m' c' a' b' ::: ty')
   Hole -> do
     hole <- freshUVar
     substUVar hole (Type expected)
@@ -812,8 +872,11 @@ inferLevel = \case
     -- TODO maybe we can get away with not throwing an error here if we store a min/max level in a UVar (...and maybe make it cumulative to play nice with Pi's max...)
     -- TODO could also say Univ can optionally take a set of UVars and has to have the max level of those + 1 (plus an optional min level)
     UV u' -> do
-      raise $ NoLevelForUVar u'
-      pure Nothing
+      lookupUVar u' >>= \case
+        Just (Type t) -> inferLowerLevel t
+        _ -> do
+          raise $ NoLevelForUVar u'
+          pure Nothing
     t -> inferLevel t
   where
     inferLowerLevel t = runMaybeT [ l - 1 | l <- MaybeT (inferLevel t), l > 0 ]
@@ -883,8 +946,19 @@ infer expr = case expr of
       check ty (Expr (pure j))
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)
+    Absurd a -> do
+      b <- infer $ Expr (Identity Bottom)
+      a' <- check b a
+      t <- UV <$> freshUVar
+      pure (Expr $ Absurd a' ::: t)
     Top -> pure (Expr $ Top ::: Univ 0)
     TT -> pure (Expr $ TT ::: Expr (Top ::: Univ 0))
+    Bool -> pure (Expr $ Bool ::: Univ 0)
+    True' -> pure (Expr $ True' ::: Expr (Bool ::: Univ 0))
+    False' -> pure (Expr $ False' ::: Expr (Bool ::: Univ 0))
+    If _ _ _ _ -> do
+      t <- UV <$> freshUVar
+      check t expr
   Hole -> UV <$> freshUVar
 
 -- | Get the type of an expression.
@@ -990,8 +1064,24 @@ step @p = \case
             pure . withType $ J c' t' p'
 
       Bottom -> pure . withType $ Bottom
+      Absurd a -> do
+        a' <- eval a
+        pure . withType $ Absurd a'
       Top -> pure . withType $ Top
       TT -> pure . withType $ TT
+      Bool -> pure . withType $ Bool
+      True' -> pure . withType $ True'
+      False' -> pure . withType $ False'
+      If m c a b -> do
+        m' <- eval m
+        c' <- eval c
+        case c' of
+          Expr (extract -> True') -> eval a
+          Expr (extract -> False') -> eval b
+          _ -> do
+            a' <- eval a
+            b' <- eval b
+            pure . withType $ If m' c' a' b'
     pure e'
   UV u -> pure $ UV u
   Hole -> absurd $ notParsed E.Refl

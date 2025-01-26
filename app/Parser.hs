@@ -12,6 +12,7 @@ import Data.Char (ord, chr, isDigit)
 import Data.Text qualified as T
 import Numeric.Natural (Natural)
 import Data.Functor ((<&>))
+import Data.Functor (($>))
 
 type Parser = Parsec Void [Token]
 
@@ -44,6 +45,14 @@ pExprNoAppOrVar = choice
   , pId
   , pRefl
   , pJ
+  , pBottom
+  , pAbsurd
+  , pTop
+  , pTT
+  , pBool
+  , pTrue
+  , pFalse
+  , pIf
   ]
 
 pVarOrUnivOrHole :: Parser Parsed
@@ -134,6 +143,43 @@ pJ = do
     _ <- parseToken TComma
     p <- pUExpr
     pure $ J c t p
+
+pBottom :: Parser ParsedExpr
+pBottom = parseToken TBottom $> Bottom
+
+pAbsurd :: Parser ParsedExpr
+pAbsurd = do
+  _ <- parseToken TAbsurd
+  a <- parens pUExpr
+  pure $ Absurd a
+
+pTop :: Parser ParsedExpr
+pTop = parseToken TTop $> Top
+
+pTT :: Parser ParsedExpr
+pTT = parseToken TTT $> TT
+
+pBool :: Parser ParsedExpr
+pBool = parseToken TBool $> Bool
+
+pTrue :: Parser ParsedExpr
+pTrue = parseToken TTrue $> True'
+
+pFalse :: Parser ParsedExpr
+pFalse = parseToken TFalse $> False'
+
+pIf :: Parser ParsedExpr
+pIf = do
+  _ <- parseToken TIf
+  parens do
+    m <- pUExpr
+    _ <- parseToken TComma
+    c <- pUExpr
+    _ <- parseToken TComma
+    t <- pUExpr
+    _ <- parseToken TComma
+    f <- pUExpr
+    pure $ If m c t f
 
 pDecl :: Parser (Decl PParsed)
 pDecl = do

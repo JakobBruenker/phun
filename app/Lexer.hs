@@ -17,6 +17,14 @@ data Token
   | TId
   | TRefl
   | TJ
+  | TBottom
+  | TAbsurd
+  | TTop
+  | TTT
+  | TBool
+  | TTrue
+  | TFalse
+  | TIf
   | TColon
   | TDot
   | TComma
@@ -33,6 +41,14 @@ instance Show Token where
     TId -> "Id"
     TRefl -> "Refl"
     TJ -> "J"
+    TBottom -> "⊥"
+    TAbsurd -> "Absurd"
+    TTop -> "⊤"
+    TTT -> "TT"
+    TBool -> "Bool"
+    TTrue -> "True"
+    TFalse -> "False"
+    TIf -> "If"
     TColon -> ":"
     TDot -> "."
     TComma -> ","
@@ -69,6 +85,16 @@ lexLine t = (toList mSol <>) <$> go t
       (T.stripPrefix "Id" -> Just rest) -> TId <:> go rest
       (T.stripPrefix "Refl" -> Just rest) -> TRefl <:> go rest
       (T.stripPrefix "J" -> Just rest) -> TJ <:> go rest
+      (T.stripPrefix "⊥" -> Just rest) -> TBottom <:> go rest
+      (T.stripPrefix "Bottom" -> Just rest) -> TBottom <:> go rest
+      (T.stripPrefix "Absurd" -> Just rest) -> TAbsurd <:> go rest
+      (T.stripPrefix "⊤" -> Just rest) -> TTop <:> go rest
+      (T.stripPrefix "Top" -> Just rest) -> TTop <:> go rest
+      (T.stripPrefix "TT" -> Just rest) -> TTT <:> go rest
+      (T.stripPrefix "Bool" -> Just rest) -> TBool <:> go rest
+      (T.stripPrefix "True" -> Just rest) -> TTrue <:> go rest
+      (T.stripPrefix "False" -> Just rest) -> TFalse <:> go rest
+      (T.stripPrefix "If" -> Just rest) -> TIf <:> go rest
       (T.stripPrefix ":" -> Just rest) -> TColon <:> go rest
       (T.stripPrefix "." -> Just rest) -> TDot <:> go rest
       (T.stripPrefix "," -> Just rest) -> TComma <:> go rest
