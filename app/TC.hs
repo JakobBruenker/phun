@@ -747,9 +747,9 @@ check expected expr = case expr of
       b <- UV <$> freshUVar
       k <- UV <$> freshUVar
       (ty, errs) <- unify expected $ Expr (Pi (Id' x) a b ::: k)
-      let x'' = getPiVar ty
       case NE.nonEmpty errs of
         Nothing -> do
+          let x'' = getPiVar ty
           let withX'' = withBinding x'' (Type a)
           rhs' <- withX'' $ check b $ renameIdOrWildcard x' x'' rhs
           -- If k is a uvar, e.g. because it was a hole, we can fill it by inferring the kind
@@ -761,7 +761,8 @@ check expected expr = case expr of
             _ -> pure ()
           pure $ Expr (Lam (Id' x'') rhs' ::: ty)
         Just es -> do
-          raise $ TypeMismatch (Just expr) expected (Expr (Pi (Id' x'') a b ::: k)) es
+          x'' <- Id' . Uniq <$> freshUnique Nothing
+          raise $ TypeMismatch (Just expr) expected (Expr (Pi x'' a b ::: k)) es
           pure $ Expr (Nonsense expr ::: ty)
 
     Id a b -> do

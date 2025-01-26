@@ -29,14 +29,6 @@ idIsId : ΠA:Type.Id(id, \a.a)
 -- \A.Refl(\y.y) -- this doesn't work at the moment, but maybe should
 \A.Refl(the _ (\y.y)) -- this works
 
--- this crashes!
--- trans : ΠA:Type.Πa:A.Πb:A.Πc:A.Πp:Id(a,b).Πq:Id(b,c).Id(a,c)
--- \A.\a.\b.\c.\p.J(_, \v.\x.?, p)
-
--- this crashes!
--- trans : ΠA:Type.Πa:A.Πb:A.Πc:A.Πp:Id(a,b).Πq:Id(b,c).Id(a,c)
--- \A.\a.\b.\c.\p.J(\x.\y.\q.q, \v.\x.?, p)
-
 trans : ΠA:Type.Πa:A.Πb:A.Πc:A.Π_:Id(a,b).Π_:Id(b,c).Id(a,c)
 \A.\a.\b.\c.\p.J(\x.\y.\q.Π_:Id(y,c).Id(x,c), \v.\q.q, p)
 

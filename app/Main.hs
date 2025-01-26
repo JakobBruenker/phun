@@ -25,16 +25,9 @@ main = do
     Right lexed -> case parseModule filename lexed of
       Left err -> hPutStrLn stderr $ errorBundlePretty err
       Right md -> do
-        -- debugging
-        T.putStrLn input
-        print md
         case runTcM $ checkModule md of
           (_, NE.nonEmpty -> Just errs) -> for_ errs (hPrint stderr)
           (Just mod'@(Module _ (Just expr)), _) -> do
-            -- debugging
-            putStrLn "printing eval'd expr"
-            print . fst . flip runReader (extractDecls mod') . runWriterT $ eval @PChecked expr -- TODO actually M.empty is not right here, we need the decls
+            print . fst . flip runReader (extractDecls mod') . runWriterT $ eval @PChecked expr
           _foo -> do
-            -- debugging
-            print _foo
             putStrLn "ok"
