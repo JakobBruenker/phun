@@ -37,7 +37,6 @@ import GHC.Records (HasField (..))
 import Data.List qualified as L
 import Control.Applicative ((<|>))
 import GHC.Stack (HasCallStack)
-import Debug.Trace
 
 -- TODO if a function is used in different places, do we have to make sure to use different uvars so it's actually generalized? Test by using id at different types.
 -- TODO This is probably only an issue if uvars remain in the declaration after inference, which maybe shouldn't be allowed to begin with
@@ -180,7 +179,7 @@ data Expr f p where
   -- ^ x:A, y:A
   Refl :: UExpr f p -> Expr f p
   J :: UExpr f p -> UExpr f p -> UExpr f p -> Expr f p
-  -- ^ C:Π_:(Id A x y).Type_n, t:Πx:A.C Refl(x), p:Id A x y
+  -- ^ C:Πx.Πy.Π_:(Id x y).Type_n, t:Πx:A.C x x Refl(x), p:Id a b
 
   -- TODO dependent sum
 
@@ -477,13 +476,7 @@ instance Unify Inferring where
               _ u'@(Name _) -> u'
               u _ -> u
         (Expr t) (Expr t') -> Expr <$> unify' t t'
-        t t' -> do
-          ctx <- ask
-          traceM $ "Context: " ++ show ctx
-          traceM $ "Unifying " ++ show t ++ " with " ++ show t'
-          t'' <- lift $ eval_ t'
-          traceM $ "Normalized to " ++ show t''
-          raise (Can'tUnifyTypes t t') *> pure t
+        t t' -> raise (Can'tUnifyTypes t t') *> pure t
 
 substUVar :: UVar -> TypeOrTerm Inferring -> TcM ()
 substUVar v t = do
@@ -735,20 +728,38 @@ check expected expr = case expr of
     J c t p -> do
       x <- UV <$> freshUVar
       y <- UV <$> freshUVar
-      a <- join $ tryUnify Nothing <$> typeOf x <*> typeOf y
-      pVar <- Id' . Uniq <$> freshUnique Nothing
-      b <- UV <$> freshUVar
+      xTy <- join $ tryUnify Nothing <$> typeOf x <*> typeOf y
       idK <- UV <$> freshUVar
       let idTy = Expr (Id x y ::: idK)
       p' <- check idTy p
-      ty <- UV <$> freshUVar
-      c' <- check (Expr (Pi pVar idTy b ::: ty)) c
-      xVar <- Id' . Uniq <$> freshUnique Nothing
+      c' <- do
+        k <- UV <$> freshUVar
+        k' <- UV <$> freshUVar
+        k'' <- UV <$> freshUVar
+        pVar <- Id' . Uniq <$> freshUnique Nothing
+        a <- Id' . Uniq <$> freshUnique Nothing
+        b <- Id' . Uniq <$> freshUnique Nothing
+        cabqTy <- UV <$> freshUVar -- Type of C a b q
+        let cabTy = Expr (Pi pVar idTy cabqTy ::: k'')
+            caTy = Expr (Pi b xTy cabTy ::: k')
+            cTy = Expr (Pi a xTy caTy ::: k)
+        check cTy c
+      c'Ty <- typeOf c'
+
+      v <- Id' . Uniq <$> freshUnique Nothing
       t' <- do 
-        ty' <- UV <$> freshUVar
-        check (Expr (Pi xVar a (Expr (App c' (Expr (Refl (Var xVar.id) ::: idTy)) ::: ty)) ::: ty')) t
-      k <- UV <$> freshUVar
-      ty' <- tryUnif (Expr (App c' p' ::: k))
+        k <- UV <$> freshUVar
+        let varV = Var v.id
+        let reflV = Expr (Refl varV ::: idTy)
+        cvTy <- fillInArg varV c'Ty
+        cvvTy <- fillInArg varV cvTy
+        cvvRvTy <- fillInArg reflV cvvTy
+        check (Expr (Pi v xTy (Expr (App (Expr (App (Expr (App c' varV ::: cvTy)) varV ::: cvvTy)) reflV ::: cvvRvTy)) ::: k)) t
+      ty' <- do
+        cxTy <- fillInArg x c'Ty
+        cxyTy <- fillInArg y cxTy
+        cxypTy <- fillInArg p' cxyTy
+        tryUnif (Expr (App (Expr (App (Expr (App c' x ::: cxTy)) y ::: cxyTy)) p' ::: cxypTy))
       pure $ Expr $ J c' t' p' ::: ty'
 
     Bottom -> Expr . (Bottom :::) <$> tryUnif (Univ 0)
@@ -800,7 +811,7 @@ getPiVar = \case
   (Expr (Pi x _ _ ::: _)) -> x.id
   e -> error $ "getPiVar called with non-Pi expression: " <> show e
 
--- infer should not use unify, and instead call check.
+-- TODO: Is infer just check with a fresh UVar as type?
 infer :: Parsed -> TcM Inferring
 infer expr = case expr of
   Univ n -> pure $ Univ n
@@ -847,23 +858,9 @@ infer expr = case expr of
       ty <- infer (Expr (Identity (Id a a)))
       a' <- infer a
       pure (Expr $ Refl a' ::: ty)
-    J c t p -> do
-      x <- UV <$> freshUVar
-      y <- UV <$> freshUVar
-      a <- join $ tryUnify Nothing <$> typeOf x <*> typeOf y
-      pVar <- Id' . Uniq <$> freshUnique Nothing
-      b <- UV <$> freshUVar
-      idK <- UV <$> freshUVar
-      let idTy = Expr (Id x y ::: idK)
+    j@(J _ _ _) -> do
       ty <- UV <$> freshUVar
-      c' <- check (Expr (Pi pVar idTy b ::: ty)) c
-      xVar <- Id' . Uniq <$> freshUnique Nothing
-      t' <- do 
-        ty' <- UV <$> freshUVar
-        check (Expr (Pi xVar a (Expr (App c' (Expr (Refl (Var xVar.id) ::: idTy)) ::: ty)) ::: ty')) t
-      p' <- check idTy p
-      b' <- fillInArg p' =<< typeOf c'
-      pure $ Expr $ J c' t' p' ::: (Expr $ App c' p' ::: b')
+      check ty (Expr (pure j))
 
     Bottom -> pure (Expr $ Bottom ::: Univ 0)
     Top -> pure (Expr $ Top ::: Univ 0)
