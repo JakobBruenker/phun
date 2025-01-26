@@ -13,6 +13,8 @@ import Data.Text qualified as T
 import Numeric.Natural (Natural)
 import Data.Functor ((<&>))
 import Data.Functor (($>))
+import Data.List qualified as NE
+import Data.List.NonEmpty (NonEmpty(..))
 
 type Parser = Parsec Void [Token]
 
@@ -35,6 +37,7 @@ pUExprNoApp :: Parser Parsed
 pUExprNoApp = choice
   [ Expr . Identity <$> pExprNoAppOrVar
   , pVarOrUnivOrHole
+  , try pArrow
   , parens pUExpr
   ]
 
@@ -98,7 +101,7 @@ pApp :: Parser Parsed
 pApp = do
   f <- pUExprNoApp
   xs <- some pUExprNoApp
-  pure $ foldl' (\a b -> Expr . Identity $ App a b) f xs
+  pure $ foldl' (((Expr . Identity) .) . App) f xs
 
 pPi :: Parser ParsedExpr
 pPi = do
@@ -109,6 +112,15 @@ pPi = do
   _ <- parseToken TDot
   b <- pUExpr
   pure $ Pi (maybe Wildcard (Id' . Name) x) a b
+
+    -- TODO: Improve this so the parentheses aren't required
+pArrow :: Parser Parsed
+pArrow = parens do
+  a <- pUExpr
+  rs <- some do
+    _ <- parseToken TArrow
+    pUExpr
+  pure $ NE.foldr1 (((Expr . Identity) .) . Pi Wildcard) (a :| rs)
 
 pLam :: Parser ParsedExpr
 pLam = do

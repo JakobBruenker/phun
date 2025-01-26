@@ -28,6 +28,7 @@ data Token
   | TColon
   | TDot
   | TComma
+  | TArrow
   | SOL -- start of line
   deriving (Eq, Ord)
 
@@ -52,6 +53,7 @@ instance Show Token where
     TColon -> ":"
     TDot -> "."
     TComma -> ","
+    TArrow -> "→"
     SOL -> "\n<SOL>"
 
 instance VisualStream [Token] where
@@ -98,6 +100,8 @@ lexLine t = (toList mSol <>) <$> go t
       (T.stripPrefix ":" -> Just rest) -> TColon <:> go rest
       (T.stripPrefix "." -> Just rest) -> TDot <:> go rest
       (T.stripPrefix "," -> Just rest) -> TComma <:> go rest
+      (T.stripPrefix "->" -> Just rest) -> TArrow <:> go rest
+      (T.stripPrefix "→" -> Just rest) -> TArrow <:> go rest
       _ | let (ident, rest) = T.span (\c -> isAlphaNum c || T.elem c "?_'" ) t', T.length ident > 0 -> TIdent ident <:> go rest
         | otherwise -> Left $ UnexpectedToken t'
 
