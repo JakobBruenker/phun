@@ -254,7 +254,6 @@ instance (Show (f (Expr f p)), Comonad f) => Show (Expr f p) where
 data Error
   -- TODO add source location (possibly just decl it appears in for simplicity)
   = TypeMismatch { msourceExpr :: Maybe Parsed, expected :: Inferring, actual :: Inferring, unifFails :: (NonEmpty UnificationFailure)}
-  | LevelMismatch { sourceExpr :: Parsed, expectedLevel :: Natural, actualLevel :: Natural }
   | VarOutOfScope Id
   | NoLevelForUVar UVar
   | HasNonsense Parsed
@@ -717,24 +716,20 @@ check expected expr = case expr of
       ty <- tryUnif (Univ lvl)
       pure (Expr $ Id a' b' ::: ty)
     Refl a -> do
-      a' <- UV <$> freshUVar
+      a' <- infer a
+      a'Ty <- typeOf a'
       u <- UV <$> freshUVar
-      (ty, errs) <- unify expected (Expr (Id a' a' ::: u))
-      aTy <- typeOf a'
-      a'' <- tryUnify (Just a) a' =<< check aTy a
-      case NE.nonEmpty errs of
-        Nothing -> do
-          pure (Expr $ Refl a'' ::: ty)
-        Just es -> do
-          raise $ TypeMismatch (Just expr) expected (Expr (Id a' a'' ::: u)) es
-          pure (Expr $ Nonsense expr ::: ty)
+      ty <- tryUnif (Expr (Id a' a' ::: u))
+      lvl <- maybe 0 (+1) <$> inferLevel a'Ty
+      traverse_ (raise . TypeMismatch (Just expr) u (Univ lvl)) . NE.nonEmpty . snd =<< unify u (Univ lvl)
+      pure (Expr $ Refl a' ::: ty)
     J c t p -> do
       x <- UV <$> freshUVar
       y <- UV <$> freshUVar
       xTy <- join $ tryUnify Nothing <$> typeOf x <*> typeOf y
       idK <- UV <$> freshUVar
-      let idTy = Expr (Id x y ::: idK)
-      p' <- check idTy p
+      let idXY = Expr (Id x y ::: idK)
+      p' <- check idXY p
       c' <- do
         k <- UV <$> freshUVar
         k' <- UV <$> freshUVar
@@ -743,7 +738,8 @@ check expected expr = case expr of
         a <- Id' . Uniq <$> freshUnique Nothing
         b <- Id' . Uniq <$> freshUnique Nothing
         cabqTy <- UV <$> freshUVar -- Type of C a b q
-        let cabTy = Expr (Pi pVar idTy cabqTy ::: k'')
+        let idAB = Expr (Id (Var a.id) (Var b.id) ::: idK)
+            cabTy = Expr (Pi pVar idAB cabqTy ::: k'')
             caTy = Expr (Pi b xTy cabTy ::: k')
             cTy = Expr (Pi a xTy caTy ::: k)
         check cTy c
@@ -753,7 +749,8 @@ check expected expr = case expr of
       t' <- do 
         k <- UV <$> freshUVar
         let varV = Var v.id
-        let reflV = Expr (Refl varV ::: idTy)
+        let idVV = Expr (Id varV varV ::: idK)
+        let reflV = Expr (Refl varV ::: idVV)
         cvTy <- fillInArg varV c'Ty
         cvvTy <- fillInArg varV cvTy
         cvvRvTy <- fillInArg reflV cvvTy
@@ -768,7 +765,7 @@ check expected expr = case expr of
     Bottom -> Expr . (Bottom :::) <$> tryUnif (Univ 0)
     Top -> Expr . (Top :::) <$> tryUnif (Univ 0)
     TT -> Expr . (TT :::) <$> tryUnif (Expr (Top ::: Univ 0))
-  Hole -> do -- We could try automatically inferring a value here, e.g. if the type is Id(a, a), we could fill in Refl(a)
+  Hole -> do
     hole <- freshUVar
     substUVar hole (Type expected)
     pure $ UV hole
