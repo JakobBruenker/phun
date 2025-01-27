@@ -165,7 +165,6 @@ instance Show (f (Expr f p)) => Show (UExpr f p) where
     UV u -> show u
     Hole -> "?"
 
--- TODO we probably need Fix or the ability to define inductive types -- although it seems like maybe a small fixed set of inductive types is enough (dep pair, dep prod, identity)
 type Expr :: (Type -> Type) -> Pass -> Type
 data Expr f p where
   Nonsense :: Parsed -> Expr f PInferring -- ^ used to assign any type to any expression
@@ -299,7 +298,6 @@ type Vars a = Map Id (TypeOrTerm a)
 -- | Typechecker monad.
 type TcM = RWS (Vars Inferring) (DList Error) TcState
 
--- TODO actually since we're always adding single elements we probably don't need a DList
 newtype DList a = DList (Endo [a]) deriving (Semigroup, Monoid) via (Endo [a])
 
 emptyDList :: DList a
@@ -341,61 +339,58 @@ lookupUVar :: UVar -> TcM (Maybe (TypeOrTerm Inferring))
 lookupUVar u = IM.lookup u.id <$> gets (.subst)
 
 -- | Get the most concrete representation we have for a UVar
-normalizeUVar :: UVar -> TcM Inferring
-normalizeUVar v = do
+zonkUVar :: UVar -> TcM Inferring
+zonkUVar v = do
   t <- lookupUVar v
   case t of
     Nothing -> pure (UV v)
     Just (Type _) -> pure (UV v)
-    Just (Term (UV v')) -> normalizeUVar v'
-    Just (Term t') -> normalize t'
+    Just (Term (UV v')) -> zonkUVar v'
+    Just (Term t') -> zonk t'
 
--- TODO maybe find a better name? normalize kind of sounds like we're reducing it (like zonk...)
--- | Replace any UVars and Vars with their most concrete representation
-normalize :: Inferring -> TcM Inferring
-normalize foo = do
+zonk :: Inferring -> TcM Inferring
+zonk foo = do
   res <- case foo of
     Univ n -> pure (Univ n)
     Var i -> lookupVar i >>= \case
-      Just (Term e') -> normalize e'
+      Just (Term e') -> zonk e'
       _ -> pure $ Var i
     Expr (e ::: t) -> do
-      e' <- normalizeExpr e
-      t' <- normalize t
+      e' <- zonkExpr e
+      t' <- zonk t
       pure $ Expr (e' ::: t')
-    UV v -> normalizeUVar v
+    UV v -> zonkUVar v
   pure res
 
-normalizeExpr :: InferringExpr -> TcM InferringExpr
-normalizeExpr = \case
+zonkExpr :: InferringExpr -> TcM InferringExpr
+zonkExpr = \case
   Nonsense e -> pure (Nonsense e)
 
-  App f x -> App <$> normalize f <*> normalize x
-  Pi i t b -> withoutBinding i.id do Pi i <$> normalize t <*> normalize b
-  Lam i b -> withoutBinding i.id do Lam i <$> normalize b
+  App f x -> App <$> zonk f <*> zonk x
+  Pi i t b -> withoutBinding i.id do Pi i <$> zonk t <*> zonk b
+  Lam i b -> withoutBinding i.id do Lam i <$> zonk b
 
-  Id a b -> Id <$> normalize a <*> normalize b
-  Refl a -> Refl <$> normalize a
-  J c t p -> J <$> normalize c <*> normalize t <*> normalize p
+  Id a b -> Id <$> zonk a <*> zonk b
+  Refl a -> Refl <$> zonk a
+  J c t p -> J <$> zonk c <*> zonk t <*> zonk p
 
   Bottom -> pure Bottom
-  Absurd a -> Absurd <$> normalize a
+  Absurd a -> Absurd <$> zonk a
   Top -> pure Top
   TT -> pure TT
   Bool -> pure Bool
   True' -> pure True'
   False' -> pure False'
-  If m c a b -> If <$> normalize m <*> normalize c <*> normalize a <*> normalize b
+  If m c a b -> If <$> zonk m <*> zonk c <*> zonk a <*> zonk b
   Nat -> pure Nat
   Zero -> pure Zero
-  Succ a -> Succ <$> normalize a
-  NatInd c b s m -> NatInd <$> normalize c <*> normalize b <*> normalize s <*> normalize m
+  Succ a -> Succ <$> zonk a
+  NatInd c b s m -> NatInd <$> zonk c <*> zonk b <*> zonk s <*> zonk m
 
 class Unify a where
   -- | Intended argument order: Expected, then actual
   unify' :: a -> a -> WriterT (DList UnificationFailure) TcM a
 
--- TODO Q: What happens if e.g. in App we unify left side first, but actually right side contains information we need to successfully unify left side?
 unify :: Inferring -> Inferring -> TcM (Inferring, [UnificationFailure])
 unify e e' = do
   re <- eval_ e
@@ -403,7 +398,7 @@ unify e e' = do
   second dListToList <$> runWriterT (unify' re re')
 
 hasUVars :: Inferring -> TcM Bool
-hasUVars = fmap go . normalize
+hasUVars = fmap go . zonk
   where
     go :: Inferring -> Bool
     go = \case
@@ -485,13 +480,9 @@ instance Unify u => Unify (Typed PInferring u) where
 
 
 instance Unify Inferring where
--- TODO we might actually have to generate unification constraints and solve them when possible, because it might be that two types are equal but we don't know yet -- maybe not though 🤔
--- TODO once we have the Id type, we probably need given constraints, since in the eliminator, equalities can hold only locally (e.g. 1 = 2)
-     -- possibly what you want to do is, in the last unification case, the failure one, go through each equality you have, normalize it, and check if it matches (possibly accounting for sym, probably not trans)
-     -- Although is that really necessary? If we can choose not to account for trans, can we just choose to have the player transport everything manually? I think yes
   unify' = \cases
     (UV u) (UV u') | u == u' -> pure $ UV u -- minor optimization: Only look up uvars if necessary
-    u u' -> join $ go <$> lift (normalize u) <*> lift (normalize u')
+    u u' -> join $ go <$> lift (zonk u) <*> lift (zonk u')
     where
       go :: Inferring -> Inferring -> WriterT (DList UnificationFailure) TcM Inferring
       go = \cases
@@ -632,11 +623,11 @@ instance Rename (f (Expr f p)) => Rename (UExpr f p) where
 -- that if the name occurs in a UVar, we can change it without having to change
 -- the global UVar mapping (Not 100% sure this is necessary)
 rename :: Id -> Id -> Inferring -> TcM Inferring
-rename orig new = fmap (rename' orig new) . normalize
+rename orig new = fmap (rename' orig new) . zonk
 
 toChecked :: Maybe Text -> Inferring -> TcM (Maybe Checked)
 toChecked declName source = do
-  reduced <- normalize source
+  reduced <- zonk source
   go reduced reduced
   where
     go :: Inferring -> Inferring -> TcM (Maybe Checked)
@@ -739,8 +730,6 @@ checkModule mod' = do
 
 -- | Check takes a type and a parsed expression that is expected to have that type
 -- NB: `join $ typeOf <$> check ty term` is guaranteed to be unifiable with ty
--- TODO: We always return the unified type here instead of expected. Could that be an issue if the unified type has a different variable than expected? And that variable is currently in context?
--- TODO: I think the main reason for using the unification result is that it's already normalized and evaluated, and we don't want to repeat that work later
 check :: Inferring -> Parsed -> TcM Inferring
 check expected expr = case expr of
   Univ n -> do
@@ -793,7 +782,7 @@ check expected expr = case expr of
           let withX'' = withBinding x'' (Type a)
           rhs' <- withX'' $ check b $ renameIdOrWildcard x' x'' rhs
           -- If k is a uvar, e.g. because it was a hole, we can fill it by inferring the kind
-          normalize k >>= \case
+          zonk k >>= \case
             UV u -> do
               rhsTy <- withX'' $ typeOf rhs'
               lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel rhsTy)
@@ -940,9 +929,9 @@ inferLevel = \case
   Univ n -> pure $ Just n
   Var a -> lookupVarType a >>= inferLowerLevel
   Expr (_ ::: t) -> inferLowerLevel t
-  UV u -> normalizeUVar u >>= \case
+  UV u -> zonkUVar u >>= \case
     -- TODO maybe we can get away with not throwing an error here if we store a min/max level in a UVar (...and maybe make it cumulative to play nice with Pi's max...)
-    -- TODO could also say Univ can optionally take a set of UVars and has to have the max level of those + 1 (plus an optional min level)
+    --      could also say Univ can optionally take a set of UVars and has to have the max level of those + 1 (plus an optional min level)
     UV u' -> do
       lookupUVar u' >>= \case
         Just (Type t) -> inferLowerLevel t
@@ -956,7 +945,7 @@ inferLevel = \case
 -- | Must be called with an expression that is a Pi type. Fills in the argument
 -- of that Pi type with the given expression, and returns the body.
 fillInArg :: HasCallStack => Eval p => UExpr (Typed p) p -> UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
-fillInArg filler e = normalizeUnchecked e >>= \case 
+fillInArg filler e = zonkUnchecked e >>= \case 
   (Expr (Pi x _ b ::: _)) -> withBinding x.id (Term filler) $ eval_ b
   e' -> error $ "fillInArg called with non-Pi expression: " <> show e'
 
@@ -966,85 +955,14 @@ getPiVar = \case
   (Expr (Pi x _ _ ::: _)) -> x.id
   e -> error $ "getPiVar called with non-Pi expression: " <> show e
 
--- TODO: Is infer just check with a fresh UVar as type?
 infer :: Parsed -> TcM Inferring
-infer expr = case expr of
-  Univ n -> pure $ Univ n
-  Var a -> pure $ Var a
-  Expr (Identity e) -> case e of
-    App f x -> do
-      a <- UV <$> freshUVar
-      b <- UV <$> freshUVar
-      i <- Uniq <$> freshUnique Nothing
-      k <- UV <$> freshUVar
-      f' <- check (Expr (Pi (Id' i) a b ::: k)) f
-      x' <- check a x
-      b' <- fillInArg x' =<< typeOf f'
-      pure (Expr $ App f' x' ::: b')
-    Pi x' a b -> do
-      x <- idOrWildcardUnique x'
-      a' <- infer a
-      let withX :: TcM a -> TcM a
-          withX = withBinding x (Type a')
-      b' <- withX . infer $ renameIdOrWildcard x' x b
-      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a' <*> withX (inferLevel b'))
-      pure (Expr $ Pi (Id' x) a' b' ::: Univ lvl)
-    Lam x' rhs -> do
-      x <- idOrWildcardUnique x'
-      a <- UV <$> freshUVar
-      let withX = withBinding x (Type a)
-      rhs' <- withX $ infer $ renameIdOrWildcard x' x rhs
-      rhsTy <- withX $ typeOf rhs'
-      lvl <- maybe 0 (+1) <$> (max <$> inferLevel a <*> inferLevel rhsTy)
-      -- TODO Q: If we later substitute x in bt, does that mean inference has to be able to use x in bt? Maybe not, if we say dependent types can't be inferred
-      -- TODO do we need this to be able to infer a type for e.g. \x.x?
-      -- TODO idea for that: Wrap infer lambda with something that checks if the bound var is not subst'd, and then make a Pi if so
-      -- TODO except it doesn't quite work like that, because we have no inferred arguments. So \x.x cannot be generalized. What about \t.\x.the t x?
-      -- TODO we could decide to default to Type in a case like \x.x
-      pure (Expr $ Lam (Id' x) rhs' ::: Expr (Pi (Id' x) a rhsTy ::: Univ lvl))
-
-    Id a b -> do
-      a' <- infer a
-      a'Ty <- typeOf a'
-      b' <- check a'Ty b
-      lvl <- maybe 0 (+1) <$> inferLevel a'Ty
-      pure (Expr $ Id a' b' ::: Univ lvl)
-    Refl a -> do
-      ty <- infer (Expr (Identity (Id a a)))
-      a' <- infer a
-      pure (Expr $ Refl a' ::: ty)
-    j@(J _ _ _) -> do
-      ty <- UV <$> freshUVar
-      check ty (Expr (pure j))
-
-    Bottom -> pure (Expr $ Bottom ::: Univ 0)
-    Absurd a -> do
-      b <- infer $ Expr (Identity Bottom)
-      a' <- check b a
-      t <- UV <$> freshUVar
-      pure (Expr $ Absurd a' ::: t)
-    Top -> pure (Expr $ Top ::: Univ 0)
-    TT -> pure (Expr $ TT ::: Expr (Top ::: Univ 0))
-    Bool -> pure (Expr $ Bool ::: Univ 0)
-    True' -> pure (Expr $ True' ::: Expr (Bool ::: Univ 0))
-    False' -> pure (Expr $ False' ::: Expr (Bool ::: Univ 0))
-    If _ _ _ _ -> do
-      t <- UV <$> freshUVar
-      check t expr
-    Nat -> pure (Expr $ Nat ::: Univ 0)
-    Zero -> pure (Expr $ Zero ::: Expr (Nat ::: Univ 0))
-    Succ a -> do
-      nat <- infer $ Expr (Identity Nat)
-      a' <- check nat a
-      pure (Expr $ Succ a' ::: nat)
-    NatInd _ _ _ _ -> do
-      t <- UV <$> freshUVar
-      check t expr
-  Hole -> UV <$> freshUVar
+infer expr = do
+  u <- freshUVar
+  check (UV u) expr
 
 class (NotParsed p, MonadReader (Vars (UExpr (Typed p) p)) (PassMonad p)) => Eval p where
   type PassMonad p :: Type -> Type
-  normalizeUnchecked :: UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
+  zonkUnchecked :: UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
   evalTypes :: Bool
   typeOf :: UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
 
@@ -1061,7 +979,7 @@ eval_ = fmap fst . runWriterT . eval
 
 -- | Brings an expression to normal form
 eval :: (Eval p, m ~ PassMonad p, e ~ UExpr (Typed p) p) => e -> WriterT (Maybe WasReduced) m e
-eval = lift . normalizeUnchecked >=> go
+eval = lift . zonkUnchecked >=> go
   where
     go e = do
       (e', wasReduced) <- listen $ step e
@@ -1070,7 +988,7 @@ eval = lift . normalizeUnchecked >=> go
 instance Eval PInferring where
   type PassMonad PInferring = TcM
   evalTypes = True
-  normalizeUnchecked = normalize
+  zonkUnchecked = zonk
   -- | Get the type of an expression.
   -- If the expression is a UVar, this will return a UVar that is registered as type of the expression's UVar
   typeOf = \case
@@ -1089,7 +1007,7 @@ instance Eval PInferring where
 instance Eval PChecked where
   type PassMonad PChecked = Reader (Vars Checked)
   evalTypes = False
-  normalizeUnchecked = pure
+  zonkUnchecked = pure
   typeOf = \case
     Univ n -> pure $ Univ (n + 1)
     Var a -> lookupVar a >>= \case
@@ -1203,25 +1121,25 @@ step @p = \case
     tellHasReduced = tell (Just WasReduced)
 
 runTcM :: TcM a -> (a, [Error])
-runTcM @a action = runRWS withNormalizedErrors M.empty (TcState 0 0 IM.empty) &
+runTcM @a action = runRWS withzonkdErrors M.empty (TcState 0 0 IM.empty) &
   \((a, errs), _, _) -> (a, errs)
   where
     -- By normalizing at the very end, we can ensure the errors contain all useful data
-    withNormalizedErrors :: TcM (a, [Error])
-    withNormalizedErrors = do
+    withzonkdErrors :: TcM (a, [Error])
+    withzonkdErrors = do
       (a, errs) <- RWS.listen action
-      traverse normalizeError (dListToList errs) >>= pure . (a,)
+      traverse zonkError (dListToList errs) >>= pure . (a,)
 
-    normalizeError :: Error -> TcM Error
-    normalizeError = \case
-      TypeMismatch e expt act errs -> TypeMismatch e <$> normalize expt <*> normalize act <*> traverse normalizeUFails errs
+    zonkError :: Error -> TcM Error
+    zonkError = \case
+      TypeMismatch e expt act errs -> TypeMismatch e <$> zonk expt <*> zonk act <*> traverse zonkUFails errs
       e -> pure e
 
-    normalizeUFails :: UnificationFailure -> TcM UnificationFailure
-    normalizeUFails = \case
-      Can'tUnifyTypes expt act -> Can'tUnifyTypes <$> normalize act <*> normalize expt
-      Can'tUnifyExprs expt act -> Can'tUnifyExprs <$> normalizeExpr act <*> normalizeExpr expt
+    zonkUFails :: UnificationFailure -> TcM UnificationFailure
+    zonkUFails = \case
+      Can'tUnifyTypes expt act -> Can'tUnifyTypes <$> zonk act <*> zonk expt
+      Can'tUnifyExprs expt act -> Can'tUnifyExprs <$> zonkExpr act <*> zonkExpr expt
       Can'tUnifyNonsense expt act -> pure $ Can'tUnifyNonsense expt act
       Can'tUnifyVars v v' -> pure $ Can'tUnifyVars v v'
       Can'tUnifyLevels l l' -> pure $ Can'tUnifyLevels l l'
-      Can'tUnifyUVarInApp e -> Can'tUnifyUVarInApp <$> normalize e
+      Can'tUnifyUVarInApp e -> Can'tUnifyUVarInApp <$> zonk e
