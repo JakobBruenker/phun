@@ -56,6 +56,10 @@ pExprNoAppOrVar = choice
   , pTrue
   , pFalse
   , pIf
+  , pNat
+  , pZero
+  , pSucc
+  , pNatInd
   ]
 
 pVarOrUnivOrHole :: Parser Parsed
@@ -192,6 +196,32 @@ pIf = do
     _ <- parseToken TComma
     f <- pUExpr
     pure $ If m c t f
+
+pNat :: Parser ParsedExpr
+pNat = parseToken TNat $> Nat
+
+pZero :: Parser ParsedExpr
+pZero = parseToken TZero $> Zero
+
+pSucc :: Parser ParsedExpr
+pSucc = do
+  _ <- parseToken TSucc
+  parens do
+    n <- pUExpr
+    pure $ Succ n
+
+pNatInd :: Parser ParsedExpr
+pNatInd = do
+  _ <- parseToken TNatInd
+  parens do
+    c <- pUExpr
+    _ <- parseToken TComma
+    b <- pUExpr
+    _ <- parseToken TComma
+    s <- pUExpr
+    _ <- parseToken TComma
+    m <- pUExpr
+    pure $ NatInd c b s m
 
 pDecl :: Parser (Decl PParsed)
 pDecl = do

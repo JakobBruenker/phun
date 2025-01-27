@@ -190,7 +190,12 @@ data Expr f p where
   True' :: Expr f p
   False' :: Expr f p
   If :: UExpr f p -> UExpr f p -> UExpr f p -> UExpr f p -> Expr f p
-  -- ^ motive:Πc:Bool.?, condition:Bool, ifTrue:C(True), ifFalse:C(False)
+  -- ^ C:Πc:Bool.?, condition:Bool, ifTrue:C(True), ifFalse:C(False)
+  Nat :: Expr f p
+  Zero :: Expr f p
+  Succ :: UExpr f p -> Expr f p
+  NatInd :: UExpr f p -> UExpr f p -> UExpr f p -> UExpr f p -> Expr f p
+  -- ^ C:Πn:Nat.?, base:C(Zero), step:Πn:Nat.(C n) -> C(Succ n)), m:Nat
 
 type IdOrWildcard :: Pass -> Type
 data IdOrWildcard p where
@@ -242,6 +247,10 @@ instance (Show (f (Expr f p)), Comonad f) => Show (Expr f p) where
     True' -> "True"
     False' -> "False"
     If m c a b -> constr "If" [m, c, a, b]
+    Nat -> "Nat"
+    Zero -> "Zero"
+    Succ a -> constr "Succ" [a]
+    NatInd c b s m -> constr "NatInd" [c, b, s, m]
     where
       constr name args = name ++ "(" ++ L.intercalate ", " (map show args) ++ ")"
 #ifdef UNICODE
@@ -377,6 +386,10 @@ normalizeExpr = \case
   True' -> pure True'
   False' -> pure False'
   If m c a b -> If <$> normalize m <*> normalize c <*> normalize a <*> normalize b
+  Nat -> pure Nat
+  Zero -> pure Zero
+  Succ a -> Succ <$> normalize a
+  NatInd c b s m -> NatInd <$> normalize c <*> normalize b <*> normalize s <*> normalize m
 
 class Unify a where
   -- | Intended argument order: Expected, then actual
@@ -414,6 +427,10 @@ hasUVars = fmap go . normalize
       True' -> False
       False' -> False
       If m c a b -> go m || go c || go a || go b
+      Nat -> False
+      Zero -> False
+      Succ a -> go a
+      NatInd c b s m -> go c || go b || go s || go m
 
 instance Unify InferringExpr where
   unify' = \cases
@@ -454,6 +471,10 @@ instance Unify InferringExpr where
     True' True' -> pure True'
     False' False' -> pure False'
     (If m c a b) (If m' c' a' b') -> If <$> unify' m m' <*> unify' c c' <*> unify' a a' <*> unify' b b'
+    Nat Nat -> pure Nat
+    Zero Zero -> pure Zero
+    (Succ a) (Succ a') -> Succ <$> unify' a a'
+    (NatInd c b s m) (NatInd c' b' s' m') -> NatInd <$> unify' c c' <*> unify' b b' <*> unify' s s' <*> unify' m m'
     t t' -> raise (Can'tUnifyExprs t t') *> pure t
 
 instance Unify u => Unify (Typed PInferring u) where
@@ -543,6 +564,10 @@ substUVar v t = do
       True' -> False
       False' -> False
       If m c a b -> occurs m || occurs c || occurs a || occurs b
+      Nat -> False
+      Zero -> False
+      Succ a -> occurs a
+      NatInd c b s m -> occurs c || occurs b || occurs s || occurs m
 
 freshUVar :: TcM UVar
 freshUVar = do
@@ -582,6 +607,10 @@ instance Rename (UExpr f p) => Rename (Expr f p) where
     True' -> True'
     False' -> False'
     If m c a b -> If (rename' orig new m) (rename' orig new c) (rename' orig new a) (rename' orig new b)
+    Nat -> Nat
+    Zero -> Zero
+    Succ a -> Succ (rename' orig new a)
+    NatInd c b s m -> NatInd (rename' orig new c) (rename' orig new b) (rename' orig new s) (rename' orig new m)
     where
       matchesOrig = any (orig ==) . getId
 
@@ -664,6 +693,17 @@ toChecked declName source = do
                 a' <- go' a
                 b' <- go' b
                 pure $ If <$> m' <*> c' <*> a' <*> b'
+              Nat -> pure $ Just Nat
+              Zero -> pure $ Just Zero
+              Succ a -> do
+                a' <- go' a
+                pure $ Succ <$> a'
+              NatInd c b s m -> do
+                c' <- go' c
+                b' <- go' b
+                s' <- go' s
+                m' <- go' m
+                pure $ NatInd <$> c' <*> b' <*> s' <*> m'
             pure $ Expr <$> liftA2 (:::) e' ty'
           UV u -> do
             raise . StillHasUnifs declName context u =<< eval_ =<< typeOf (UV u)
@@ -846,6 +886,37 @@ check expected expr = case expr of
       mcTy <- fillInArg c' m'Ty
       ty' <- tryUnif (Expr (App m' c' ::: mcTy))
       pure (Expr $ If m' c' a' b' ::: ty')
+    Nat -> Expr . (Nat :::) <$> tryUnif (Univ 0)
+    Zero -> Expr . (Zero :::) <$> tryUnif (Expr (Nat ::: Univ 0))
+    Succ a -> do
+      nat <- infer $ Expr (Identity Nat)
+      a' <- check nat a
+      pure (Expr $ Succ a' ::: expected)
+    NatInd c b s m -> do
+      rhs <- UV <$> freshUVar
+      k <- UV <$> freshUVar
+      nat <- infer $ Expr (Identity Nat)
+      c' <- do
+        n <- Id' . Uniq <$> freshUnique Nothing
+        check (Expr (Pi n nat rhs ::: k)) c
+      cTy <- typeOf c'
+      zero <- infer $ Expr (Identity Zero)
+      c0Ty <- fillInArg zero cTy
+      b' <- check (Expr (App c' zero ::: c0Ty)) b
+      s' <- do
+        n <- Id' . Uniq <$> freshUnique Nothing
+        let varN = Var n.id
+        cnTy <- fillInArg varN cTy
+        let sn = Expr (Succ (Var n.id) ::: nat)
+        csnTy <- fillInArg sn cTy
+        x <- Id' . Uniq <$> freshUnique Nothing
+        k' <- UV <$> freshUVar
+        k'' <- UV <$> freshUVar
+        check (Expr (Pi n nat (Expr (Pi x (Expr (App c' varN ::: cnTy)) (Expr (App c' sn ::: csnTy)) ::: k'')) ::: k')) s
+      m' <- check nat m
+      cmTy <- fillInArg m' cTy
+      ty' <- tryUnif (Expr (App c' m' ::: cmTy))
+      pure (Expr $ NatInd c' b' s' m' ::: ty')
   Hole -> do
     hole <- freshUVar
     substUVar hole (Type expected)
@@ -960,28 +1031,22 @@ infer expr = case expr of
     If _ _ _ _ -> do
       t <- UV <$> freshUVar
       check t expr
+    Nat -> pure (Expr $ Nat ::: Univ 0)
+    Zero -> pure (Expr $ Zero ::: Expr (Nat ::: Univ 0))
+    Succ a -> do
+      nat <- infer $ Expr (Identity Nat)
+      a' <- check nat a
+      pure (Expr $ Succ a' ::: nat)
+    NatInd _ _ _ _ -> do
+      t <- UV <$> freshUVar
+      check t expr
   Hole -> UV <$> freshUVar
-
--- | Get the type of an expression.
--- If the expression is a UVar, this will return a UVar that is registered as type of the expression's UVar
-typeOf :: Inferring -> TcM Inferring
-typeOf = \case
-  Univ n -> pure $ Univ (n + 1)
-  Var a -> lookupVarType a
-  Expr (_ ::: t) -> pure t
-  UV u -> do
-    lookupUVar u >>= \case
-      Just (Type t) -> pure t
-      Just (Term t) -> typeOf t
-      Nothing -> do
-        t <- UV <$> freshUVar
-        substUVar u (Type t)
-        pure t
 
 class (NotParsed p, MonadReader (Vars (UExpr (Typed p) p)) (PassMonad p)) => Eval p where
   type PassMonad p :: Type -> Type
   normalizeUnchecked :: UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
   evalTypes :: Bool
+  typeOf :: UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
 
 class NotParsed p where notParsed :: p E.:~: PParsed -> Void
 instance NotParsed PInferring where notParsed = \case
@@ -1006,11 +1071,32 @@ instance Eval PInferring where
   type PassMonad PInferring = TcM
   evalTypes = True
   normalizeUnchecked = normalize
+  -- | Get the type of an expression.
+  -- If the expression is a UVar, this will return a UVar that is registered as type of the expression's UVar
+  typeOf = \case
+    Univ n -> pure $ Univ (n + 1)
+    Var a -> lookupVarType a
+    Expr (_ ::: t) -> pure t
+    UV u -> do
+      lookupUVar u >>= \case
+        Just (Type t) -> pure t
+        Just (Term t) -> typeOf t
+        Nothing -> do
+          t <- UV <$> freshUVar
+          substUVar u (Type t)
+          pure t
 
 instance Eval PChecked where
   type PassMonad PChecked = Reader (Vars Checked)
   evalTypes = False
   normalizeUnchecked = pure
+  typeOf = \case
+    Univ n -> pure $ Univ (n + 1)
+    Var a -> lookupVar a >>= \case
+      Just (Term term) -> typeOf term
+      Just (Type ty) -> pure ty
+      Nothing -> error $ "Var type not found in checked code: " <> show a
+    Expr (_ ::: t) -> pure t
 
 type HasVars :: (Type -> Type) -> Constraint
 class HasVars m where
@@ -1083,6 +1169,24 @@ step @p = \case
             a' <- eval a
             b' <- eval b
             pure . withType $ If m' c' a' b'
+      Nat -> pure . withType $ Nat
+      Zero -> pure . withType $ Zero
+      Succ a -> withType . Succ <$> eval a
+      NatInd c b s m -> do
+        m' <- eval m
+        case m' of
+          Expr (extract -> Zero) -> eval b
+          Expr (extract -> Succ n) -> do
+            s' <- eval s
+            c' <- eval c
+            b' <- eval b
+            k <- lift $ typeOf ty'
+            pure . withType $ App s' (Expr (NatInd c' b' s' n ::: Expr (App c' n ::: k)))
+          _ -> do
+            c' <- eval c
+            b' <- eval b
+            s' <- eval s
+            pure . withType $ NatInd c' b' s' m'
     pure e'
   UV u -> pure $ UV u
   Hole -> absurd $ notParsed E.Refl

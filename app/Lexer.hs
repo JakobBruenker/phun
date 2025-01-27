@@ -25,6 +25,10 @@ data Token
   | TTrue
   | TFalse
   | TIf
+  | TNat
+  | TZero
+  | TSucc
+  | TNatInd
   | TColon
   | TDot
   | TComma
@@ -50,6 +54,10 @@ instance Show Token where
     TTrue -> "True"
     TFalse -> "False"
     TIf -> "If"
+    TNat -> "Nat"
+    TZero -> "Zero"
+    TSucc -> "Succ"
+    TNatInd -> "NatInd"
     TColon -> ":"
     TDot -> "."
     TComma -> ","
@@ -79,31 +87,38 @@ lexLine t = (toList mSol <>) <$> go t
       _ | "--" `T.isPrefixOf` t' || T.null t' -> Right []
       (T.stripPrefix "(" -> Just rest) -> TLParen <:> go rest
       (T.stripPrefix ")" -> Just rest) -> TRParen <:> go rest
-      (T.stripPrefix "Pi" -> Just rest) -> TPi <:> go rest
+      (T.stripPrefix "Pi" -> Just rest) | endOfWord rest -> TPi <:> go rest
       (T.stripPrefix "Π" -> Just rest) -> TPi <:> go rest
       (T.stripPrefix "∏" -> Just rest) -> TPi <:> go rest
       (T.stripPrefix "\\" -> Just rest) -> TLambda <:> go rest
       (T.stripPrefix "λ" -> Just rest) -> TLambda <:> go rest
-      (T.stripPrefix "Id" -> Just rest) -> TId <:> go rest
-      (T.stripPrefix "Refl" -> Just rest) -> TRefl <:> go rest
-      (T.stripPrefix "J" -> Just rest) -> TJ <:> go rest
+      (T.stripPrefix "Id" -> Just rest) | endOfWord rest -> TId <:> go rest
+      (T.stripPrefix "Refl" -> Just rest) | endOfWord rest -> TRefl <:> go rest
+      (T.stripPrefix "J" -> Just rest) | endOfWord rest -> TJ <:> go rest
       (T.stripPrefix "⊥" -> Just rest) -> TBottom <:> go rest
-      (T.stripPrefix "Bottom" -> Just rest) -> TBottom <:> go rest
-      (T.stripPrefix "Absurd" -> Just rest) -> TAbsurd <:> go rest
+      (T.stripPrefix "Bottom" -> Just rest) | endOfWord rest -> TBottom <:> go rest
+      (T.stripPrefix "Absurd" -> Just rest) | endOfWord rest -> TAbsurd <:> go rest
       (T.stripPrefix "⊤" -> Just rest) -> TTop <:> go rest
-      (T.stripPrefix "Top" -> Just rest) -> TTop <:> go rest
-      (T.stripPrefix "TT" -> Just rest) -> TTT <:> go rest
-      (T.stripPrefix "Bool" -> Just rest) -> TBool <:> go rest
-      (T.stripPrefix "True" -> Just rest) -> TTrue <:> go rest
-      (T.stripPrefix "False" -> Just rest) -> TFalse <:> go rest
-      (T.stripPrefix "If" -> Just rest) -> TIf <:> go rest
+      (T.stripPrefix "Top" -> Just rest) | endOfWord rest -> TTop <:> go rest
+      (T.stripPrefix "TT" -> Just rest) | endOfWord rest -> TTT <:> go rest
+      (T.stripPrefix "Bool" -> Just rest) | endOfWord rest -> TBool <:> go rest
+      (T.stripPrefix "True" -> Just rest) | endOfWord rest -> TTrue <:> go rest
+      (T.stripPrefix "False" -> Just rest) | endOfWord rest -> TFalse <:> go rest
+      (T.stripPrefix "If" -> Just rest) | endOfWord rest -> TIf <:> go rest
+      (T.stripPrefix "Nat" -> Just rest) | endOfWord rest -> TNat <:> go rest
+      (T.stripPrefix "Zero" -> Just rest) | endOfWord rest -> TZero <:> go rest
+      (T.stripPrefix "Succ" -> Just rest) | endOfWord rest -> TSucc <:> go rest
+      (T.stripPrefix "NatInd" -> Just rest) | endOfWord rest -> TNatInd <:> go rest
       (T.stripPrefix ":" -> Just rest) -> TColon <:> go rest
       (T.stripPrefix "." -> Just rest) -> TDot <:> go rest
       (T.stripPrefix "," -> Just rest) -> TComma <:> go rest
       (T.stripPrefix "->" -> Just rest) -> TArrow <:> go rest
       (T.stripPrefix "→" -> Just rest) -> TArrow <:> go rest
-      _ | let (ident, rest) = T.span (\c -> isAlphaNum c || T.elem c "?_'" ) t', T.length ident > 0 -> TIdent ident <:> go rest
+      _ | let (ident, rest) = T.span isIdentChar t', T.length ident > 0 -> TIdent ident <:> go rest
         | otherwise -> Left $ UnexpectedToken t'
+      where
+        isIdentChar c = isAlphaNum c || T.elem c "?_'"
+        endOfWord = maybe True (not . isIdentChar . fst) . T.uncons
 
 lexFile :: Text -> Either LexerError [Token]
 lexFile = fmap concat . traverse lexLine . T.lines
