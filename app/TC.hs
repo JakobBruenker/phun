@@ -39,6 +39,7 @@ import Control.Applicative ((<|>))
 import GHC.Stack (HasCallStack)
 
 -- TODO it might make more sense to infer the universe levels in a separate pass, after inference
+-- TODO Split this file into multiple modules
 
 type Module :: Pass -> Type
 data Module p = Module 
