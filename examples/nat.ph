@@ -20,7 +20,7 @@ plusComm : Πn:_. Πm:_. Id(plus n m, plus m n)
 λn.λm.NatInd(
   λx.Id(plus n x, plus x n),
   plusZeroRight n,
-  λx.λp.trans Nat _ _ _ (plusSucc n x) (cong _ _ (λx.Succ(x)) _ _ p),
+  λx.λp.trans _ _ _ _ (plusSucc n x) (cong _ _ (λx.Succ(x)) _ _ p),
   m)
 
 -- If there is an expression at the end of the file, it will be evaluated and printed
