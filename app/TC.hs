@@ -955,9 +955,9 @@ inferLevel = \case
 
 -- | Must be called with an expression that is a Pi type. Fills in the argument
 -- of that Pi type with the given expression, and returns the body.
-fillInArg :: HasCallStack => Inferring -> Inferring -> TcM Inferring
-fillInArg filler e = normalize e >>= \case 
-  (Expr (Pi x _ b ::: _)) -> withBinding x.id (Term filler) $ normalize b
+fillInArg :: HasCallStack => Eval p => UExpr (Typed p) p -> UExpr (Typed p) p -> PassMonad p (UExpr (Typed p) p)
+fillInArg filler e = normalizeUnchecked e >>= \case 
+  (Expr (Pi x _ b ::: _)) -> withBinding x.id (Term filler) $ eval_ b
   e' -> error $ "fillInArg called with non-Pi expression: " <> show e'
 
 -- | Must be called with an expression that is a Pi type. Returns the name of the bound variable.
@@ -1121,38 +1121,38 @@ step @p = \case
     e' <- case e of
       Nonsense e' -> pure . withType $ Nonsense e'
       App f x -> do
-        f' <- eval f
-        x' <- eval x
+        f' <- step f
+        x' <- step x
         case f' of
           Expr (extract -> Lam i rhs) -> do
             tellHasReduced
-            withBinding i.id (Term x') $ eval rhs
+            withBinding i.id (Term x') $ step rhs
           _ -> pure . withType $ App f' x'
       Pi x a b -> do
-        a' <- eval a
-        b' <- eval b
+        a' <- step a
+        b' <- step b
         pure . withType $ Pi x a' b'
-      Lam x b -> withType . Lam x <$> eval b
+      Lam x b -> withType . Lam x <$> step b
 
       Id a b -> do
-        a' <- eval a
-        b' <- eval b
+        a' <- step a
+        b' <- step b
         pure . withType $ Id a' b'
-      Refl a -> withType . Refl <$> eval a
+      Refl a -> withType . Refl <$> step a
       J c t p -> do
-        t' <- eval t
-        p' <- eval p
+        t' <- step t
+        p' <- step p
         case p' of
           Expr (extract -> Refl x) -> do
               tellHasReduced
               pure . withType $ App t' x
           _ -> do
-            c' <- eval c
+            c' <- step c
             pure . withType $ J c' t' p'
 
       Bottom -> pure . withType $ Bottom
       Absurd a -> do
-        a' <- eval a
+        a' <- step a
         pure . withType $ Absurd a'
       Top -> pure . withType $ Top
       TT -> pure . withType $ TT
@@ -1160,32 +1160,41 @@ step @p = \case
       True' -> pure . withType $ True'
       False' -> pure . withType $ False'
       If m c a b -> do
-        m' <- eval m
-        c' <- eval c
+        m' <- step m
+        c' <- step c
         case c' of
-          Expr (extract -> True') -> eval a
-          Expr (extract -> False') -> eval b
+          Expr (extract -> True') -> do
+            tellHasReduced
+            step a
+          Expr (extract -> False') -> do
+            tellHasReduced
+            step b
           _ -> do
-            a' <- eval a
-            b' <- eval b
+            a' <- step a
+            b' <- step b
             pure . withType $ If m' c' a' b'
       Nat -> pure . withType $ Nat
       Zero -> pure . withType $ Zero
-      Succ a -> withType . Succ <$> eval a
+      Succ a -> withType . Succ <$> step a
       NatInd c b s m -> do
-        m' <- eval m
+        m' <- step m
         case m' of
-          Expr (extract -> Zero) -> eval b
+          Expr (extract -> Zero) -> do
+            tellHasReduced
+            step b
           Expr (extract -> Succ n) -> do
-            s' <- eval s
-            c' <- eval c
-            b' <- eval b
+            tellHasReduced
+            s' <- step s
+            c' <- step c
+            b' <- step b
             k <- lift $ typeOf ty'
-            pure . withType $ App s' (Expr (NatInd c' b' s' n ::: Expr (App c' n ::: k)))
+            sTy <- lift $ typeOf s'
+            snTy <- lift $ fillInArg n sTy
+            pure . withType $ App (Expr (App s' n ::: snTy)) (Expr (NatInd c' b' s' n ::: Expr (App c' n ::: k)))
           _ -> do
-            c' <- eval c
-            b' <- eval b
-            s' <- eval s
+            c' <- step c
+            b' <- step b
+            s' <- step s
             pure . withType $ NatInd c' b' s' m'
     pure e'
   UV u -> pure $ UV u
