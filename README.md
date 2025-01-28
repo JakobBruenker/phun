@@ -55,8 +55,8 @@ At this point there are also no custom types, instead you have to make do with t
   implement a function at multiple levels if you need it at more than one.
 - `Πx:A.B` - The type of dependent functions from `A` to `B`.
 - `A → B` - This is just syntactic sugar for `Π_:A.B`.
-- `⊥` (or `Top`) - The type with no inhabitants.
-- `⊤` (or `Bottom`) - The type with only one inhabitant, `TT`.
+- `⊥` (or `Bottom`) - The type with no inhabitants.
+- `⊤` (or `Top`) - The type with only one inhabitant, `TT`.
 - `Bool` - The type of booleans.
 - `Nat` - The type of natural numbers.
 - `Id` - The identity type.
